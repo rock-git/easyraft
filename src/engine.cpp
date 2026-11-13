@@ -1332,10 +1332,10 @@ StepResult Engine::on_install_response(NodeId from, const InstallSnapshotRespons
     return out;
   }
   if (response.installed || response.stale) {
+    // Trust the follower's applied index. The leader may have compacted
+    // further while this reply was in flight; using the local snapshot index
+    // would skip a prefix the follower has not installed.
     LogIndex caught = response.follower_index;
-    if (response.installed && snapshot_) {
-      caught = std::max(caught, snapshot_->meta.last_included.index);
-    }
     if (caught > last_index_) {
       caught = last_index_;
     }
@@ -1343,9 +1343,6 @@ StepResult Engine::on_install_response(NodeId from, const InstallSnapshotRespons
       progress.match_index = caught;
     }
     progress.next_index = progress.match_index + 1;
-    if (response.stale && progress.next_index < first_available_index()) {
-      progress.next_index = first_available_index();
-    }
     progress.snapshot_offset = 0;
     progress.last_ack_tick = now_;
     const LogIndex before = commit_index_;
