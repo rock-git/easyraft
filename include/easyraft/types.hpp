@@ -285,6 +285,27 @@ inline std::optional<Membership> Membership::decode(std::string_view bytes) {
   return joint_of(std::move(configs[0]), std::move(configs[1]));
 }
 
+// Identifies one durable image of applied state. `last_included` is the last
+// log entry the image covers. `membership` is the effective config at that
+// index, uniform or joint. `snapshot_id` changes when the image does.
+struct SnapshotMeta {
+  LogId last_included{};
+  Membership membership{};
+  std::string snapshot_id;
+
+  friend bool operator==(const SnapshotMeta&, const SnapshotMeta&) = default;
+};
+
+// Opaque application bytes plus the meta that places them in the log.
+struct Snapshot {
+  SnapshotMeta meta{};
+  std::string data;
+};
+
+inline std::string snapshot_id_from(const LogId& id) {
+  return std::to_string(id.index) + "-" + std::to_string(id.term) + "-" + std::to_string(id.node);
+}
+
 inline bool log_is_up_to_date(const std::optional<LogId>& candidate,
                               const std::optional<LogId>& local) {
   if (!local) {
