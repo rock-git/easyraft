@@ -197,7 +197,8 @@ void RaftNode::restore_if_present() {
   auto vote = check(storage_->load_vote());
   Vote restored = vote.value_or(Vote{});
   auto snapshot = check(storage_->load_snapshot());
-  if (snapshot && state_machine_) {
+  if (snapshot && state_machine_ &&
+      state_machine_->last_applied() < snapshot->meta.last_included.index) {
     check(state_machine_->install_snapshot(snapshot->meta, snapshot->data));
   }
   auto stored = check(storage_->read(1, UINT64_MAX));

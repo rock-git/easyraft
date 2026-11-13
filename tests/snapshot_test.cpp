@@ -253,6 +253,39 @@ TEST(FileLogStorage, CorruptSnapshotFailsOpenAndLeavesTheLog) {
   EXPECT_NE(log_bytes.find("survive"), std::string::npos);
 }
 
+TEST(FileLogStorage, CorruptSnapshotDoesNotRepairATornLog) {
+  TempDir dir;
+  const auto path = dir.path();
+  const auto log_path = path / "log";
+  {
+    FileLogStorage storage(path);
+    ASSERT_TRUE(storage.append({app(1, "one"), app(2, "two"), app(3, "three")}).ok());
+    ASSERT_TRUE(storage.save_snapshot(image_of(LogId{1, 1, 1}, Membership{{1}}, "state")).ok());
+  }
+  std::string torn = read_bytes(log_path);
+  ASSERT_GT(torn.size(), 20u);
+  torn.resize(torn.size() - 10);
+  write_bytes(log_path, torn);
+  std::string broken = read_bytes(path / "snapshot");
+  ASSERT_FALSE(broken.empty());
+  broken.back() = static_cast<char>(static_cast<unsigned char>(broken.back()) ^ 0xffu);
+  write_bytes(path / "snapshot", broken);
+
+  FileLogStorage storage(path);
+  EXPECT_FALSE(storage.read(1, 10).ok());
+  EXPECT_EQ(read_bytes(log_path), torn);
+}
+
+TEST(MemoryLogStorage, RejectsSnapshotLargerThanPeersCanInstall) {
+  MemoryLogStorage storage;
+  std::string huge(static_cast<std::size_t>(kMaxSnapshotDataBytes) + 1, 'x');
+  const auto saved = storage.save_snapshot(image_of(LogId{1, 1, 1}, Membership{{1}}, std::move(huge)));
+  EXPECT_FALSE(saved.ok());
+  EXPECT_FALSE(storage.load_snapshot().value().has_value());
+  ASSERT_TRUE(storage.append({app(1, "kept")}).ok());
+  EXPECT_EQ(storage.read(1, 1).value().front().data, "kept");
+}
+
 TEST(FileLogStorage, PurgedSuffixKeepsTornTailRecovery) {
   TempDir dir;
   const auto path = dir.path();
@@ -428,13 +461,19 @@ TEST(EngineSnapshot, ConflictingSnapshotDropsTheSuffix) {
   EXPECT_TRUE(engine.log().empty());
   EXPECT_EQ(engine.membership(), (Membership{{2, 4}}));
   EXPECT_EQ(engine.last_applied(), 2u);
-  bool truncated = false;
-  for (const Command& command : installed.step.commands) {
+  int truncate_at = -1;
+  int purge_at = -1;
+  for (int i = 0; i < static_cast<int>(installed.step.commands.size()); ++i) {
+    const Command& command = installed.step.commands[static_cast<std::size_t>(i)];
     if (command.kind == CommandKind::Truncate && command.index == 3) {
-      truncated = true;
+      truncate_at = i;
+    }
+    if (command.kind == CommandKind::Purge && command.index == 2) {
+      purge_at = i;
     }
   }
-  EXPECT_TRUE(truncated);
+  EXPECT_GE(truncate_at, 0);
+  EXPECT_GT(purge_at, truncate_at);
 }
 
 std::uint64_t prevote_probe(const StepResult& step) {
@@ -506,6 +545,8 @@ TEST(EngineSnapshot, InstallReplyDoesNotSkipANewerLocalSnapshot) {
   const SnapshotBuild first = engine.begin_snapshot();
   ASSERT_TRUE(first.started);
   const LogIndex first_index = engine.compacted_index();
+  ASSERT_TRUE(engine.snapshot_meta().has_value());
+  const std::string first_id = engine.snapshot_meta()->snapshot_id;
   engine.store_snapshot_bytes("first");
 
   ASSERT_TRUE(engine.propose("three").accepted);
@@ -522,8 +563,10 @@ TEST(EngineSnapshot, InstallReplyDoesNotSkipANewerLocalSnapshot) {
   installed.request_vote = engine.vote();
   installed.responder_vote = engine.vote().non_committed();
   installed.follower_index = first_index;
+  installed.snapshot_id = first_id;
   const StepResult followed = engine.on_install_response(3, installed);
-  EXPECT_TRUE(sends_current_snapshot(followed, 3, second_index)) << engine.debug();
+  EXPECT_FALSE(sends_current_snapshot(followed, 3, second_index)) << engine.debug();
+  EXPECT_TRUE(sends_current_snapshot(engine.replicate_now(), 3, second_index)) << engine.debug();
 
   InstallSnapshotResponse stale;
   stale.stale = true;
@@ -539,6 +582,8 @@ TEST(EngineSnapshot, InstallReplyDoesNotSkipANewerLocalSnapshot) {
   ack_from(other, 2);
   ASSERT_TRUE(other.begin_snapshot().started);
   const LogIndex stale_index = other.compacted_index();
+  ASSERT_TRUE(other.snapshot_meta().has_value());
+  const std::string stale_id = other.snapshot_meta()->snapshot_id;
   other.store_snapshot_bytes("first");
   ASSERT_TRUE(other.propose("three").accepted);
   ack_from(other, 2);
@@ -546,10 +591,12 @@ TEST(EngineSnapshot, InstallReplyDoesNotSkipANewerLocalSnapshot) {
   const LogIndex newer_index = other.compacted_index();
   other.store_snapshot_bytes("second");
   stale.follower_index = stale_index;
+  stale.snapshot_id = stale_id;
   stale.request_vote = other.vote();
   stale.responder_vote = other.vote().non_committed();
   const StepResult ignored = other.on_install_response(3, stale);
-  EXPECT_TRUE(sends_current_snapshot(ignored, 3, newer_index)) << other.debug();
+  EXPECT_FALSE(sends_current_snapshot(ignored, 3, newer_index)) << other.debug();
+  EXPECT_TRUE(sends_current_snapshot(other.replicate_now(), 3, newer_index)) << other.debug();
 }
 
 TEST(EngineSnapshot, LeaderSendsSnapshotToANewVoter) {
@@ -807,6 +854,108 @@ TEST(SnapshotCluster, ThresholdCompactsASingleNode) {
   cluster.restart(1);
   ASSERT_EQ(cluster.machine(1).data().size(), 1u);
   EXPECT_EQ(cluster.machine(1).data().front(), "one");
+}
+
+TEST(EngineSnapshot, CompactedRejectionAdvancesTheProbe) {
+  Engine leader(1, pinned(4));
+  leader.recover(Membership{{1, 2}}, Vote{}, {});
+  become_leader(leader);
+  ASSERT_EQ(leader.role(), Role::Leader) << leader.debug();
+  ASSERT_TRUE(leader.propose("one").accepted);
+  ASSERT_TRUE(leader.propose("two").accepted);
+  ASSERT_TRUE(leader.propose("three").accepted);
+
+  AppendEntriesResponse rejected;
+  rejected.success = false;
+  rejected.compacted = true;
+  rejected.probed_next = 1;
+  rejected.hint_next = 4;
+  rejected.request_vote = leader.vote();
+  rejected.responder_vote = leader.vote().non_committed();
+  const StepResult stepped = leader.on_append_response(2, rejected);
+  bool saw = false;
+  for (const Outbound& message : stepped.outbound) {
+    if (message.to != 2) {
+      continue;
+    }
+    const auto* request = std::get_if<AppendEntriesRequest>(&message.payload);
+    ASSERT_NE(request, nullptr);
+    ASSERT_FALSE(request->entries.empty());
+    EXPECT_EQ(request->entries.front().id.index, 4u);
+    saw = true;
+  }
+  EXPECT_TRUE(saw) << leader.debug();
+}
+
+TEST(EngineSnapshot, CompactedJointStillFinishes) {
+  Engine engine(1, pinned(4));
+  const Membership joint = Membership::joint_of({1, 2, 3}, {1, 2, 4});
+  engine.recover(joint, Vote{}, {}, 2, image_of(LogId{1, 1, 2}, joint, "state"));
+  EXPECT_TRUE(engine.membership().is_joint());
+  become_leader(engine);
+  ASSERT_EQ(engine.role(), Role::Leader) << engine.debug();
+  ack_from(engine, 2);
+
+  bool finished = false;
+  for (const LogEntry& item : engine.log()) {
+    if (item.kind != EntryKind::Membership) {
+      continue;
+    }
+    const std::optional<Membership> decoded = Membership::decode(item.data);
+    ASSERT_TRUE(decoded.has_value());
+    EXPECT_FALSE(decoded->is_joint());
+    EXPECT_EQ(decoded->voters(), (std::vector<NodeId>{1, 2, 4}));
+    finished = true;
+  }
+  EXPECT_TRUE(finished) << engine.debug();
+}
+
+class CursorMachine final : public RaftStateMachine {
+ public:
+  explicit CursorMachine(LogIndex applied) : last_(applied) {}
+
+  Result<void> apply(const LogEntry& applied) override {
+    if (applied.id.index > last_) {
+      last_ = applied.id.index;
+    }
+    return Result<void>::success();
+  }
+
+  LogIndex last_applied() const override { return last_; }
+
+  Result<std::string> build_snapshot() override { return Result<std::string>::success({}); }
+
+  Result<void> install_snapshot(const SnapshotMeta& meta, std::string_view) override {
+    ++installs;
+    if (meta.last_included.index < last_) {
+      return Result<void>::failure(Error::Rejected);
+    }
+    last_ = meta.last_included.index;
+    return Result<void>::success();
+  }
+
+  int installs{0};
+
+ private:
+  LogIndex last_;
+};
+
+TEST(NodeSnapshot, KeepsAStateMachineAheadOfTheSnapshot) {
+  auto storage = std::make_shared<MemoryLogStorage>();
+  ASSERT_TRUE(storage->save_membership(Membership{{1}}).ok());
+  ASSERT_TRUE(storage->save_vote(Vote{}).ok());
+  const LogEntry first = entry(1, 1, 1, EntryKind::Application, "a");
+  const LogEntry second = entry(1, 1, 2, EntryKind::Application, "b");
+  ASSERT_TRUE(storage->append({first, second}).ok());
+  ASSERT_TRUE(storage->save_snapshot(image_of(first.id, Membership{{1}}, "state")).ok());
+
+  auto machine = std::make_shared<CursorMachine>(2);
+  RaftNode node(1, pinned(6), storage, machine, nullptr);
+  EXPECT_TRUE(node.initialized());
+  EXPECT_EQ(machine->installs, 0);
+  EXPECT_EQ(machine->last_applied(), 2u);
+  ASSERT_EQ(node.log().size(), 1u);
+  EXPECT_EQ(node.log().front().id.index, 2u);
 }
 
 INSTANTIATE_TEST_SUITE_P(

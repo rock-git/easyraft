@@ -140,7 +140,8 @@ class MemoryLogStorage final : public RaftLogStorage {
 
  private:
   bool snapshot_acceptable(const Snapshot& snapshot) const {
-    if (snapshot.meta.last_included.index == 0 || snapshot.meta.snapshot_id.empty()) {
+    if (snapshot.meta.last_included.index == 0 || snapshot.meta.snapshot_id.empty() ||
+        snapshot.data.size() > kMaxSnapshotDataBytes) {
       return false;
     }
     if (snapshot_ && snapshot.meta.last_included.index < snapshot_->meta.last_included.index) {

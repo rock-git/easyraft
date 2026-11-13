@@ -50,8 +50,9 @@ namespace easyraft {
 // matches and the record is incomplete or its body checksum fails. A length
 // checksum mismatch is not a torn tail: open returns Error::Storage and
 // leaves the file unchanged. Any other integrity or I/O failure does the
-// same. A corrupt snapshot file fails the open the same way and leaves the
-// log file unchanged. The commit index is not stored past the snapshot.
+// same. A corrupt snapshot is detected before torn-tail recovery, so the open
+// fails and the log file is left unchanged. The commit index is not stored
+// past the snapshot.
 class FileLogStorage final : public RaftLogStorage {
  public:
   explicit FileLogStorage(std::filesystem::path directory);
