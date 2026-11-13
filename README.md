@@ -11,7 +11,7 @@ Included:
 - Leader election with PreVote (enabled by default)
 - AppendEntries replication, including conflict truncation that deletes only the divergent suffix
 - Commit when a majority of the fixed voter set has an entry from the current leader
-- Persistence of the vote, the static membership, and the log, and recovery after the node object is rebuilt
+- Persistence of the vote, the static membership, and the log (`MemoryLogStorage` or `FileLogStorage`), and recovery after the node object is rebuilt
 - A standard majority quorum: `floor(n / 2) + 1`
 - Membership fixed at `initialize()`. Every member is a voter
 
@@ -39,6 +39,7 @@ A follower accepts AppendEntries only after it accepts the leader's vote. If `pr
 | `include/easyraft/state_machine.hpp` | `RaftStateMachine` |
 | `include/easyraft/network.hpp` | `MessageBus` |
 | `include/easyraft/memory.hpp` | In-memory storage and state machine |
+| `include/easyraft/file.hpp` | Durable directory storage (`FileLogStorage`) |
 | `tests/cluster.hpp` | In-process cluster with a fake clock |
 
 `MessageBus::send` must queue. Delivering inside `send` re-enters the engine. The test cluster drains the queue after each tick.
@@ -75,6 +76,15 @@ auto index = node.write("value");
 ```
 
 On a multi-node cluster, pass a `MessageBus` and deliver envelopes back through `RaftNode::on_message`. `write` returns `Error::NotLeader` when the node cannot accept the proposal. `current_leader()` is the established leader, when this node knows one.
+
+`FileLogStorage` is the same `RaftLogStorage` contract, rooted at a directory. It stores `vote`, `membership`, and an append-only `log`. Metadata files are replaced with a temp file, fsync, rename, and a directory fsync. Creating the directory fsyncs each parent that gained a new entry. Log appends and truncations fsync before they return success. Opening the directory drops a torn or checksum-failed final record when its length checksum still matches. A corrupt length prefix is left on disk and reported as a storage error. The commit index is not stored, and this class does not snapshot or compact the log.
+
+```cpp
+auto storage = std::make_shared<easyraft::FileLogStorage>("/var/lib/easyraft/1");
+auto machine = std::make_shared<easyraft::MemoryStateMachine>();
+easyraft::RaftNode node(1, easyraft::Config{}, storage, machine, /*bus=*/nullptr);
+node.initialize(easyraft::Membership{{1}});
+```
 
 `Config::heartbeat_interval`, `election_timeout_min`, and `election_timeout_max` are all in ticks. `enable_pre_vote` defaults to true.
 

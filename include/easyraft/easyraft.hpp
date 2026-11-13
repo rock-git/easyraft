@@ -6,6 +6,7 @@
 #include "easyraft/config.hpp"
 #include "easyraft/engine.hpp"
 #include "easyraft/error.hpp"
+#include "easyraft/file.hpp"
 #include "easyraft/memory.hpp"
 #include "easyraft/messages.hpp"
 #include "easyraft/network.hpp"
