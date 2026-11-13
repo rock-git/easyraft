@@ -695,6 +695,10 @@ Result<void> FileLogStorage::truncate_from(LogIndex index) {
   offsets_.resize(keep);
   end_offset_ = new_end;
   if (fsync_retry(log_fd_) != 0) {
+    // The suffix is gone in this process, but it may come back after a crash.
+    // A later truncate of the same index would see an empty suffix and return
+    // success without another fsync, so the handle must not stay usable.
+    failed_ = true;
     return storage_error();
   }
   return Result<void>::success();
