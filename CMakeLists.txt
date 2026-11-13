@@ -35,6 +35,7 @@ if(BUILD_TESTING)
     tests/election_test.cpp
     tests/replication_test.cpp
     tests/persistence_test.cpp
+    tests/file_storage_test.cpp
     tests/partition_test.cpp
     tests/node_test.cpp
   )
