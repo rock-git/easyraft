@@ -5,7 +5,10 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
+#include <cstdint>
 #include <string>
+#include <variant>
 
 namespace easyraft {
 namespace {
@@ -152,6 +155,99 @@ TEST(Engine, ConflictingSuffixIsTruncatedAndOverwritten) {
     }
   }
   EXPECT_TRUE(truncated);
+}
+
+std::uint64_t prevote_probe(const StepResult& step) {
+  for (const Outbound& message : step.outbound) {
+    if (const auto* request = std::get_if<PreVoteRequest>(&message.payload)) {
+      return request->probe;
+    }
+  }
+  return 0;
+}
+
+TEST(Engine, NonVoterGrantDoesNotCompleteElection) {
+  Engine engine(1, pinned(2));
+  engine.recover(Membership{{1, 2, 3}}, Vote{}, {});
+  engine.on_tick();
+  const StepResult started = engine.on_tick();
+  const std::uint64_t probe = prevote_probe(started);
+  ASSERT_NE(probe, 0u);
+
+  PreVoteResponse outsider;
+  outsider.probe = probe;
+  outsider.body.granted = true;
+  engine.on_pre_vote_response(99, outsider);
+  EXPECT_EQ(engine.term(), 0u);
+  EXPECT_EQ(engine.role(), Role::Follower);
+
+  PreVoteResponse voter;
+  voter.probe = probe;
+  voter.body.granted = true;
+  engine.on_pre_vote_response(2, voter);
+  EXPECT_EQ(engine.term(), 1u);
+  EXPECT_EQ(engine.role(), Role::Candidate);
+
+  VoteResponse forged;
+  forged.granted = true;
+  forged.vote = engine.vote();
+  engine.on_vote_response(99, forged);
+  EXPECT_NE(engine.role(), Role::Leader);
+
+  engine.on_vote_response(2, forged);
+  EXPECT_EQ(engine.role(), Role::Leader);
+}
+
+TEST(Engine, StalePreVoteGrantDoesNotStartElection) {
+  Engine engine(1, pinned(2));
+  engine.recover(Membership{{1, 2, 3}}, Vote{}, {});
+  engine.on_tick();
+  const std::uint64_t first = prevote_probe(engine.on_tick());
+  ASSERT_NE(first, 0u);
+  engine.on_tick();
+  const std::uint64_t second = prevote_probe(engine.on_tick());
+  ASSERT_NE(second, 0u);
+  ASSERT_NE(first, second);
+
+  PreVoteResponse stale;
+  stale.probe = first;
+  stale.body.granted = true;
+  engine.on_pre_vote_response(2, stale);
+  EXPECT_EQ(engine.term(), 0u);
+  EXPECT_EQ(engine.role(), Role::Follower);
+
+  PreVoteResponse current;
+  current.probe = second;
+  current.body.granted = true;
+  engine.on_pre_vote_response(2, current);
+  EXPECT_EQ(engine.term(), 1u);
+  EXPECT_EQ(engine.role(), Role::Candidate);
+}
+
+TEST(Engine, LeaderHeartbeatCancelsOutstandingPreVote) {
+  Engine engine(2, pinned(4));
+  Vote leader_vote;
+  leader_vote.leader = LeaderId{1, 1};
+  leader_vote.committed = true;
+  engine.recover(Membership{{1, 2, 3}}, leader_vote, {});
+
+  std::uint64_t probe = 0;
+  for (int tick = 0; tick < 4; ++tick) {
+    probe = std::max(probe, prevote_probe(engine.on_tick()));
+  }
+  ASSERT_NE(probe, 0u);
+  EXPECT_EQ(engine.term(), 1u);
+
+  AppendEntriesRequest heartbeat;
+  heartbeat.vote = leader_vote;
+  engine.on_append(heartbeat);
+
+  PreVoteResponse delayed;
+  delayed.probe = probe;
+  delayed.body.granted = true;
+  engine.on_pre_vote_response(3, delayed);
+  EXPECT_EQ(engine.role(), Role::Follower);
+  EXPECT_EQ(engine.term(), 1u);
 }
 
 TEST(Engine, PrevMismatchTruncatesOnlyTheConflictingSuffix) {

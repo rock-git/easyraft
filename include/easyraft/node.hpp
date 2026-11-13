@@ -33,6 +33,9 @@ class RaftNode {
   void on_message(const Envelope& message);
 
   bool initialized() const { return initialized_; }
+  // A failed storage or state-machine command. The node stays inert until it
+  // is destroyed and rebuilt from storage.
+  bool failed() const { return failed_; }
   NodeId id() const { return id_; }
   Role role() const { return engine_.role(); }
   Term term() const { return engine_.term(); }
@@ -55,6 +58,7 @@ class RaftNode {
   MessageBus* bus_;
   Engine engine_;
   bool initialized_{false};
+  bool failed_{false};
 };
 
 }  // namespace easyraft
