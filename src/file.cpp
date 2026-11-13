@@ -84,6 +84,40 @@ class UniqueFd {
   int fd_;
 };
 
+bool fsync_directory_at(const std::filesystem::path& path) {
+  UniqueFd fd{::open(path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC)};
+  if (!fd) {
+    return false;
+  }
+  return fsync_retry(fd.get()) == 0;
+}
+
+// `existing` is the deepest ancestor that was already present before
+// create_directories. Fsync each parent that received a new directory entry.
+// When `created` itself already existed, fsync only its immediate parent so a
+// previous crash cannot leave that entry unpersisted.
+bool fsync_directory_parents(const std::filesystem::path& created,
+                             const std::filesystem::path& existing) {
+  const std::filesystem::path parent = created.parent_path();
+  if (parent.empty() || parent == created) {
+    return true;
+  }
+  std::filesystem::path at = parent;
+  while (true) {
+    if (!fsync_directory_at(at)) {
+      return false;
+    }
+    if (created == existing || at == existing) {
+      return true;
+    }
+    const std::filesystem::path next = at.parent_path();
+    if (next.empty() || next == at) {
+      return false;
+    }
+    at = next;
+  }
+}
+
 bool write_all(int fd, const void* data, std::size_t size) {
   const auto* bytes = static_cast<const std::uint8_t*>(data);
   std::size_t done = 0;
@@ -391,8 +425,23 @@ bool FileLogStorage::open_directory(std::filesystem::path directory) {
   if (ec) {
     return false;
   }
+  std::filesystem::path existing = directory_;
+  while (!existing.empty()) {
+    std::error_code exists_ec;
+    if (std::filesystem::exists(existing, exists_ec)) {
+      break;
+    }
+    if (exists_ec) {
+      return false;
+    }
+    const std::filesystem::path parent = existing.parent_path();
+    if (parent.empty() || parent == existing) {
+      return false;
+    }
+    existing = parent;
+  }
   std::filesystem::create_directories(directory_, ec);
-  if (ec) {
+  if (ec || !fsync_directory_parents(directory_, existing)) {
     return false;
   }
   dir_fd_ = ::open(directory_.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
