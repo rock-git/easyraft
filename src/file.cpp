@@ -34,7 +34,11 @@ constexpr std::uint32_t kMaxVoters = 100000u;
 constexpr std::uint32_t kMaxSnapshotId = 1024u;
 constexpr std::uint64_t kMaxMetaBytes = 1u << 20;
 constexpr std::uint64_t kMaxSnapshotBytes = 64ull << 20;
-constexpr std::uint64_t kMaxSnapshotFile = kMaxSnapshotBytes + kMaxMetaBytes + 64u;
+// magic, version, index, term, node, id length, membership length, data length, crc.
+constexpr std::uint64_t kSnapshotOverhead = 52;
+// Every byte encode_snapshot can write must fit through load_snapshot.
+constexpr std::uint64_t kMaxSnapshotFile =
+    kMaxSnapshotBytes + kMaxMetaBytes + kMaxSnapshotId + kSnapshotOverhead;
 
 constexpr const char* kVoteName = "vote";
 constexpr const char* kMembershipName = "membership";
