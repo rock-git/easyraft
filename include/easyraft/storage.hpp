@@ -6,10 +6,16 @@
 #include "easyraft/error.hpp"
 #include "easyraft/types.hpp"
 
+#include <cstdint>
 #include <optional>
 #include <vector>
 
 namespace easyraft {
+
+// Largest snapshot image FileLogStorage will store and a follower will
+// assemble. MemoryLogStorage uses the same cap so a local compaction cannot
+// delete a prefix that peers are unable to install.
+inline constexpr std::uint64_t kMaxSnapshotDataBytes = 64ull << 20;
 
 // Persistent Raft log and hard state.
 //

@@ -33,12 +33,11 @@ constexpr std::uint64_t kRecordFraming = 8;
 constexpr std::uint32_t kMaxVoters = 100000u;
 constexpr std::uint32_t kMaxSnapshotId = 1024u;
 constexpr std::uint64_t kMaxMetaBytes = 1u << 20;
-constexpr std::uint64_t kMaxSnapshotBytes = 64ull << 20;
 // magic, version, index, term, node, id length, membership length, data length, crc.
 constexpr std::uint64_t kSnapshotOverhead = 52;
 // Every byte encode_snapshot can write must fit through load_snapshot.
 constexpr std::uint64_t kMaxSnapshotFile =
-    kMaxSnapshotBytes + kMaxMetaBytes + kMaxSnapshotId + kSnapshotOverhead;
+    kMaxSnapshotDataBytes + kMaxMetaBytes + kMaxSnapshotId + kSnapshotOverhead;
 
 constexpr const char* kVoteName = "vote";
 constexpr const char* kMembershipName = "membership";
@@ -437,7 +436,7 @@ std::optional<Membership> decode_membership(const std::string& bytes) {
 std::optional<std::string> encode_snapshot(const Snapshot& snapshot) {
   if (snapshot.meta.last_included.index == 0 || snapshot.meta.snapshot_id.empty() ||
       snapshot.meta.snapshot_id.size() > kMaxSnapshotId ||
-      snapshot.data.size() > kMaxSnapshotBytes) {
+      snapshot.data.size() > kMaxSnapshotDataBytes) {
     return std::nullopt;
   }
   const std::string membership = snapshot.meta.membership.encode();
@@ -510,7 +509,7 @@ std::optional<Snapshot> decode_snapshot(const std::string& bytes) {
   snapshot.meta.membership = *membership;
   offset += membership_len;
   std::uint64_t data_len = 0;
-  if (!read_u64(data, bytes.size(), offset, data_len) || data_len > kMaxSnapshotBytes) {
+  if (!read_u64(data, bytes.size(), offset, data_len) || data_len > kMaxSnapshotDataBytes) {
     return std::nullopt;
   }
   offset += 8;
@@ -594,14 +593,19 @@ bool decode_entry(const std::uint8_t* body, std::uint32_t body_len, LogEntry& en
 }  // namespace
 
 FileLogStorage::FileLogStorage(std::filesystem::path directory) {
-  if (!open_directory(std::move(directory)) || !open_log() || fsync_retry(dir_fd_) != 0) {
+  if (!open_directory(std::move(directory))) {
     failed_ = true;
     return;
   }
-  // A missing snapshot is a fresh store. A checksum failure fails the open
-  // and leaves the log file alone.
+  // Check the snapshot before torn-tail recovery. A corrupt image must not
+  // truncate the log on the way to reporting the failure.
   const Result<std::optional<Snapshot>> snapshot = load_snapshot();
   if (!snapshot.ok()) {
+    failed_ = true;
+    fsync_retry(dir_fd_);
+    return;
+  }
+  if (!open_log() || fsync_retry(dir_fd_) != 0) {
     failed_ = true;
   }
 }

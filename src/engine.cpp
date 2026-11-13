@@ -2,6 +2,7 @@
 // Copyright 2026 easyraft contributors
 
 #include "easyraft/engine.hpp"
+#include "easyraft/storage.hpp"
 
 #include <algorithm>
 #include <sstream>
@@ -128,11 +129,13 @@ StepResult Engine::recover(Membership membership,
     snapshot_ = std::move(snapshot);
     snapshot_data_ready_ = true;
     base_membership_ = snapshot_->meta.membership;
-    if (saw_covered) {
-      out.commands.push_back(purge_command(covered));
-    }
+    // Drop a conflicting suffix before the prefix. A crash between the two
+    // leaves the mismatched boundary in place, so the next open still sees it.
     if (mismatch) {
       out.commands.push_back(truncate_command(covered + 1));
+    }
+    if (saw_covered) {
+      out.commands.push_back(purge_command(covered));
     }
   }
   const LogIndex compacted = compacted_index();
@@ -377,6 +380,7 @@ AppendStep Engine::on_append(const AppendEntriesRequest& request) {
     if (compacted_index() > 0) {
       // The leader is speaking from index 1, which this snapshot already replaced.
       step.response.success = false;
+      step.response.compacted = true;
       step.response.hint_next = first_available_index();
       step.response.responder_vote = vote_;
       return step;
@@ -385,6 +389,7 @@ AppendStep Engine::on_append(const AppendEntriesRequest& request) {
     // The compacted prefix is the previous entry. Entries after it may append.
   } else if (request.prev_log_id->index <= compacted_index()) {
     step.response.success = false;
+    step.response.compacted = true;
     step.response.hint_next = first_available_index();
     step.response.responder_vote = vote_;
     return step;
@@ -501,6 +506,18 @@ StepResult Engine::on_append_response(NodeId from, const AppendEntriesResponse& 
     return out;
   }
   if (response.rejected_by_vote) {
+    return out;
+  }
+  // The follower already compacted this probe. Move forward to the hinted
+  // index and let the next append check that log id. Do not credit a match.
+  if (response.compacted) {
+    if (response.hint_next > progress.next_index) {
+      progress.next_index = response.hint_next;
+    }
+    if (progress.next_index < progress.match_index + 1) {
+      progress.next_index = progress.match_index + 1;
+    }
+    send_append(out, from);
     return out;
   }
   // Conflict: walk the probe backward, but never into the matched prefix.
@@ -1039,7 +1056,17 @@ void Engine::continue_membership(StepResult& out) {
       latest = &entry;
     }
   }
-  if (latest == nullptr || latest->id.index > commit_index_) {
+  if (latest == nullptr) {
+    // A committed joint can live only in the snapshot after the entry was purged.
+    if (!snapshot_ || !snapshot_->meta.membership.is_joint() ||
+        snapshot_->meta.membership.configs().size() != 2) {
+      return;
+    }
+    const Membership uniform{snapshot_->meta.membership.configs()[1]};
+    append_local(out, EntryKind::Membership, uniform.encode());
+    return;
+  }
+  if (latest->id.index > commit_index_) {
     return;
   }
   std::optional<Membership> decoded = Membership::decode(latest->data);
@@ -1229,10 +1256,12 @@ void Engine::install_snapshot(StepResult& out, Snapshot snapshot) {
   last_applied_ = covered;
   membership_ = membership_from_log();
   out.commands.push_back(save_snapshot_command(*snapshot_, false));
-  out.commands.push_back(purge_command(covered));
   if (!keep_suffix) {
+    // Truncate first so a crash cannot purge the mismatched boundary and then
+    // treat the divergent suffix as a consistent continuation.
     out.commands.push_back(truncate_command(covered + 1));
   }
+  out.commands.push_back(purge_command(covered));
   if (membership_ != previous) {
     out.commands.push_back(save_membership_command(membership_));
     if (leading_) {
@@ -1243,11 +1272,12 @@ void Engine::install_snapshot(StepResult& out, Snapshot snapshot) {
 }
 
 InstallStep Engine::on_install(const InstallSnapshotRequest& request) {
-  constexpr std::size_t kMaxIncoming = 64u << 20;
+  const auto kMaxIncoming = static_cast<std::size_t>(kMaxSnapshotDataBytes);
   InstallStep step;
   step.response.request_vote = request.vote;
   step.response.responder_vote = vote_;
   step.response.follower_index = last_applied_;
+  step.response.snapshot_id = request.meta.snapshot_id;
   if (!initialized_) {
     step.response.rejected_by_vote = true;
     return step;
@@ -1329,6 +1359,10 @@ StepResult Engine::on_install_response(NodeId from, const InstallSnapshotRespons
   }
   Progress& progress = found->second;
   if (response.rejected_by_vote) {
+    return out;
+  }
+  // A delayed ack for a previous image must not move this transfer.
+  if (!snapshot_ || response.snapshot_id != snapshot_->meta.snapshot_id) {
     return out;
   }
   if (response.installed || response.stale) {
