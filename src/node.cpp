@@ -150,6 +150,31 @@ Result<LogIndex> RaftNode::change_membership(std::vector<NodeId> voters) {
   return Result<LogIndex>::success(proposed.index);
 }
 
+Result<void> RaftNode::trigger_snapshot() {
+  if (failed_) {
+    return Result<void>::failure(Error::Storage);
+  }
+  if (!initialized_) {
+    return Result<void>::failure(Error::NotInitialized);
+  }
+  const SnapshotBuild built = engine_.begin_snapshot();
+  if (!built.started) {
+    return Result<void>::failure(Error::Rejected);
+  }
+  try {
+    apply(built.step);
+    if (!failed_ && role() == Role::Leader) {
+      apply(engine_.replicate_now());
+    }
+  } catch (const std::runtime_error&) {
+    return Result<void>::failure(Error::Storage);
+  }
+  if (failed_) {
+    return Result<void>::failure(Error::Storage);
+  }
+  return Result<void>::success();
+}
+
 void RaftNode::tick() {
   if (failed_ || !initialized_) {
     return;
@@ -171,9 +196,14 @@ void RaftNode::restore_if_present() {
   }
   auto vote = check(storage_->load_vote());
   Vote restored = vote.value_or(Vote{});
+  auto snapshot = check(storage_->load_snapshot());
+  if (snapshot && state_machine_) {
+    check(state_machine_->install_snapshot(snapshot->meta, snapshot->data));
+  }
   auto stored = check(storage_->read(1, UINT64_MAX));
   const LogIndex already_applied = state_machine_ ? state_machine_->last_applied() : 0;
-  apply(engine_.recover(std::move(*membership), restored, std::move(stored), already_applied));
+  apply(engine_.recover(std::move(*membership), restored, std::move(stored), already_applied,
+                        std::move(snapshot)));
   initialized_ = true;
 }
 
@@ -198,6 +228,19 @@ void RaftNode::apply(const StepResult& step) {
           break;
         case CommandKind::Apply:
           check(state_machine_->apply(command.entry));
+          break;
+        case CommandKind::SaveSnapshot: {
+          Snapshot image = command.snapshot;
+          if (command.build_snapshot) {
+            image.data = check(state_machine_->build_snapshot());
+            engine_.store_snapshot_bytes(image.data);
+          }
+          check(storage_->save_snapshot(image));
+          check(state_machine_->install_snapshot(image.meta, image.data));
+          break;
+        }
+        case CommandKind::Purge:
+          check(storage_->purge_through(command.index));
           break;
       }
     }
@@ -248,6 +291,12 @@ void RaftNode::dispatch(const Envelope& message) {
           send(message.from, step.response);
         } else if constexpr (std::is_same_v<T, AppendEntriesResponse>) {
           apply(engine_.on_append_response(message.from, payload));
+        } else if constexpr (std::is_same_v<T, InstallSnapshotRequest>) {
+          InstallStep step = engine_.on_install(payload);
+          apply(step.step);
+          send(message.from, step.response);
+        } else if constexpr (std::is_same_v<T, InstallSnapshotResponse>) {
+          apply(engine_.on_install_response(message.from, payload));
         }
       },
       message.payload);

@@ -32,6 +32,10 @@ class RaftNode {
   // locally; the uniform target is appended once the joint entry commits.
   // Returns the joint entry's index. An unchanged set returns the last index.
   Result<LogIndex> change_membership(std::vector<NodeId> voters);
+  // Compact through the applied index. Followers may compact locally; only a
+  // leader replicates the image. `Rejected` means nothing new has been applied
+  // since the current snapshot.
+  Result<void> trigger_snapshot();
   void tick();
 
   void on_message(const Envelope& message);
@@ -48,6 +52,9 @@ class RaftNode {
   std::optional<NodeId> current_leader() const { return engine_.current_leader(); }
   LogIndex commit_index() const { return engine_.commit_index(); }
   LogIndex last_log_index() const { return engine_.last_index(); }
+  LogIndex first_available_index() const { return engine_.first_available_index(); }
+  LogIndex compacted_index() const { return engine_.compacted_index(); }
+  std::optional<SnapshotMeta> snapshot_meta() const { return engine_.snapshot_meta(); }
   const std::vector<LogEntry>& log() const { return engine_.log(); }
   std::string debug() const { return engine_.debug(); }
 
