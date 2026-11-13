@@ -273,5 +273,55 @@ TEST(Engine, PrevMismatchTruncatesOnlyTheConflictingSuffix) {
   EXPECT_EQ(rejected.response.hint_next, 2u);
 }
 
+void grant_prevote(Engine& engine, NodeId from, std::uint64_t probe) {
+  PreVoteResponse response;
+  response.probe = probe;
+  response.body.granted = true;
+  engine.on_pre_vote_response(from, response);
+}
+
+TEST(Engine, JointQuorumCountsEveryConfig) {
+  Engine engine(1, pinned(4));
+  engine.recover(Membership::joint_of({1, 2, 3}, {3, 4, 5}), Vote{}, {});
+
+  std::uint64_t probe = 0;
+  for (int tick = 0; tick < 4; ++tick) {
+    probe = std::max(probe, prevote_probe(engine.on_tick()));
+  }
+  ASSERT_NE(probe, 0u);
+  grant_prevote(engine, 2, probe);
+  grant_prevote(engine, 3, probe);
+  EXPECT_EQ(engine.term(), 0u);
+  grant_prevote(engine, 4, probe);
+  EXPECT_EQ(engine.term(), 1u);
+  EXPECT_EQ(engine.role(), Role::Candidate);
+
+  VoteResponse granted;
+  granted.granted = true;
+  granted.vote = engine.vote();
+  engine.on_vote_response(2, granted);
+  engine.on_vote_response(3, granted);
+  EXPECT_NE(engine.role(), Role::Leader);
+  engine.on_vote_response(4, granted);
+  EXPECT_EQ(engine.role(), Role::Leader);
+
+  const ProposeResult proposed = engine.propose("joint");
+  ASSERT_TRUE(proposed.accepted);
+  const LogIndex index = proposed.index;
+  EXPECT_EQ(engine.commit_index(), 0u);
+
+  AppendEntriesResponse ack;
+  ack.success = true;
+  ack.request_vote = engine.vote();
+  ack.responder_vote = engine.vote().non_committed();
+  ack.match_index = index;
+  engine.on_append_response(4, ack);
+  engine.on_append_response(5, ack);
+  EXPECT_EQ(engine.commit_index(), 0u) << "new-config majority alone must not commit";
+
+  engine.on_append_response(2, ack);
+  EXPECT_EQ(engine.commit_index(), index);
+}
+
 }  // namespace
 }  // namespace easyraft

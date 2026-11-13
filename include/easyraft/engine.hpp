@@ -110,6 +110,8 @@ class Engine {
 
   const LogEntry* find(LogIndex index) const;
   std::optional<LogId> last_log_id() const;
+  bool has_quorum(const std::set<NodeId>& grants) const;
+  std::optional<LogIndex> quorum_match_index() const;
   std::uint64_t sample_timeout();
   bool follower_lease_valid() const;
   bool leader_quorum_lease_valid() const;
