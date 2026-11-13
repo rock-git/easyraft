@@ -17,6 +17,21 @@ Command save_vote_command(const Vote& vote) {
   return command;
 }
 
+Command save_membership_command(const Membership& membership) {
+  Command command;
+  command.kind = CommandKind::SaveMembership;
+  command.membership = membership;
+  return command;
+}
+
+struct RaiseFlag {
+  bool& flag;
+  explicit RaiseFlag(bool& raised) : flag(raised) { flag = true; }
+  ~RaiseFlag() { flag = false; }
+  RaiseFlag(const RaiseFlag&) = delete;
+  RaiseFlag& operator=(const RaiseFlag&) = delete;
+};
+
 Command truncate_command(LogIndex index) {
   Command command;
   command.kind = CommandKind::Truncate;
@@ -53,7 +68,6 @@ StepResult Engine::recover(Membership membership,
                             std::vector<LogEntry> log,
                             LogIndex already_applied) {
   StepResult out;
-  membership_ = std::move(membership);
   log_ = std::move(log);
   last_index_ = log_.empty() ? 0 : log_.back().id.index;
   commit_index_ = 0;
@@ -64,6 +78,11 @@ StepResult Engine::recover(Membership membership,
   pre_campaign_.reset();
   progress_.clear();
   ever_contacted_ = false;
+  base_membership_ = infer_base(membership);
+  membership_ = membership_from_log();
+  if (membership_ != membership) {
+    out.commands.push_back(save_membership_command(membership_));
+  }
   // A restarted process is not an established leader. Keep the term so a
   // higher vote is still required, but clear the committed bit that would
   // otherwise make this node resume leadership without a quorum.
@@ -93,6 +112,9 @@ StepResult Engine::on_tick() {
   if (now_ >= next_election_at_) {
     election_timeout_ticks_ = sample_timeout();
     next_election_at_ = now_ + election_timeout_ticks_;
+    if (!membership_.contains(id_)) {
+      return out;
+    }
     if (config_.enable_pre_vote) {
       pre_elect(out);
     } else {
@@ -114,12 +136,48 @@ ProposeResult Engine::propose(std::string data) {
   return result;
 }
 
+ProposeResult Engine::change_membership(std::vector<NodeId> voters) {
+  ProposeResult result;
+  if (!initialized_ || !leading_ || role_ != Role::Leader) {
+    return result;
+  }
+  std::sort(voters.begin(), voters.end());
+  voters.erase(std::unique(voters.begin(), voters.end()), voters.end());
+  if (voters.empty() || voters.front() == 0 || membership_changing()) {
+    return result;
+  }
+  if (voters == membership_.voters()) {
+    result.accepted = true;
+    result.index = last_index_;
+    return result;
+  }
+  const Membership joint = Membership::joint_of(membership_.voters(), std::move(voters));
+  const LogIndex joint_index = last_index_ + 1;
+  append_local(result.step, EntryKind::Membership, joint.encode());
+  result.accepted = true;
+  result.index = joint_index;
+  replicate_all(result.step);
+  return result;
+}
+
+bool Engine::membership_changing() const {
+  if (membership_.is_joint()) {
+    return true;
+  }
+  for (const LogEntry& entry : log_) {
+    if (entry.kind == EntryKind::Membership && entry.id.index > commit_index_) {
+      return true;
+    }
+  }
+  return false;
+}
+
 VoteStep Engine::on_pre_vote(const VoteRequest& request) {
   VoteStep step;
   step.response.vote = vote_;
   step.response.last_log_id = last_log_id();
   step.response.granted = false;
-  if (!initialized_) {
+  if (!initialized_ || !membership_.contains(id_)) {
     return step;
   }
 
@@ -167,7 +225,7 @@ VoteStep Engine::on_vote(const VoteRequest& request) {
   step.response.vote = vote_;
   step.response.last_log_id = last_log_id();
   step.response.granted = false;
-  if (!initialized_) {
+  if (!initialized_ || !membership_.contains(id_)) {
     return step;
   }
 
@@ -281,9 +339,21 @@ AppendStep Engine::on_append(const AppendEntriesRequest& request) {
     std::vector<LogEntry> tail(request.entries.begin() + static_cast<std::ptrdiff_t>(mismatch),
                                request.entries.end());
     if (!tail.empty()) {
+      std::optional<Membership> appended_membership;
+      for (const LogEntry& item : tail) {
+        if (item.kind != EntryKind::Membership) {
+          continue;
+        }
+        if (auto decoded = Membership::decode(item.data)) {
+          appended_membership = std::move(*decoded);
+        }
+      }
       log_.insert(log_.end(), tail.begin(), tail.end());
       last_index_ = log_.back().id.index;
       step.step.commands.push_back(append_command(std::move(tail)));
+      if (appended_membership) {
+        adopt_membership(step.step, std::move(*appended_membership));
+      }
     }
   }
 
@@ -379,11 +449,27 @@ std::string Engine::debug() const {
     out << entry.id;
     if (entry.kind == EntryKind::Blank) {
       out << " blank";
+    } else if (entry.kind == EntryKind::Membership) {
+      out << " membership";
     } else {
       out << " \"" << entry.data << "\"";
     }
   }
-  out << "]";
+  out << "] membership=";
+  const std::vector<std::vector<NodeId>>& configs = membership_.configs();
+  for (std::size_t c = 0; c < configs.size(); ++c) {
+    if (c != 0) {
+      out << "|";
+    }
+    out << "[";
+    for (std::size_t i = 0; i < configs[c].size(); ++i) {
+      if (i != 0) {
+        out << ",";
+      }
+      out << configs[c][i];
+    }
+    out << "]";
+  }
   return out.str();
 }
 
@@ -530,9 +616,15 @@ void Engine::append_local(StepResult& out, EntryKind kind, std::string data) {
   entry.data = std::move(data);
   log_.push_back(entry);
   last_index_ = entry.id.index;
+  const bool membership_entry = entry.kind == EntryKind::Membership;
   std::vector<LogEntry> batch;
-  batch.push_back(entry);
+  batch.push_back(std::move(entry));
   out.commands.push_back(append_command(std::move(batch)));
+  if (membership_entry) {
+    if (auto decoded = Membership::decode(log_.back().data)) {
+      adopt_membership(out, std::move(*decoded));
+    }
+  }
   advance_commit(out);
 }
 
@@ -542,6 +634,16 @@ void Engine::truncate_from(StepResult& out, LogIndex index) {
   }
   log_.resize(static_cast<std::size_t>(index - 1));
   last_index_ = log_.empty() ? 0 : log_.back().id.index;
+  Membership next = membership_from_log();
+  if (next != membership_) {
+    membership_ = std::move(next);
+    // Persist the restored config before deleting the suffix. A crash in
+    // between leaves the log entry in place, and recover prefers the log.
+    out.commands.push_back(save_membership_command(membership_));
+    if (leading_) {
+      sync_progress();
+    }
+  }
   out.commands.push_back(truncate_command(index));
 }
 
@@ -599,6 +701,7 @@ void Engine::advance_commit(StepResult& out) {
     if (entry != nullptr && entry->id.term == vote_.leader.term && entry->id.node == id_) {
       commit_index_ = index;
       enqueue_applies(out);
+      continue_membership(out);
       return;
     }
   }
@@ -724,6 +827,105 @@ void Engine::elect(StepResult& out) {
   }
   role_ = Role::Candidate;
   send_vote_requests(out, false, candidate_vote);
+}
+
+void Engine::adopt_membership(StepResult& out, Membership next) {
+  if (next == membership_) {
+    return;
+  }
+  membership_ = std::move(next);
+  out.commands.push_back(save_membership_command(membership_));
+  if (leading_) {
+    sync_progress();
+  }
+}
+
+Membership Engine::infer_base(const Membership& stored) const {
+  for (const LogEntry& entry : log_) {
+    if (entry.kind != EntryKind::Membership) {
+      continue;
+    }
+    const std::optional<Membership> decoded = Membership::decode(entry.data);
+    if (!decoded || !decoded->is_joint() || decoded->configs().size() != 2) {
+      return stored;
+    }
+    return Membership{decoded->configs().front()};
+  }
+  return stored;
+}
+
+Membership Engine::membership_from_log() const {
+  Membership current = base_membership_;
+  for (const LogEntry& entry : log_) {
+    if (entry.kind != EntryKind::Membership) {
+      continue;
+    }
+    if (std::optional<Membership> decoded = Membership::decode(entry.data)) {
+      current = std::move(*decoded);
+    }
+  }
+  return current;
+}
+
+void Engine::sync_progress() {
+  if (!leading_) {
+    return;
+  }
+  std::set<NodeId> wanted(membership_.voters().begin(), membership_.voters().end());
+  wanted.erase(id_);
+  for (auto it = progress_.begin(); it != progress_.end();) {
+    if (wanted.find(it->first) == wanted.end()) {
+      it = progress_.erase(it);
+    } else {
+      ++it;
+    }
+  }
+  for (NodeId voter : wanted) {
+    if (progress_.find(voter) != progress_.end()) {
+      continue;
+    }
+    Progress progress;
+    // There is no snapshot, so a newly added voter is sent the log from index 1.
+    progress.next_index = 1;
+    progress.match_index = 0;
+    progress.last_ack_tick = now_;
+    progress_.emplace(voter, progress);
+  }
+}
+
+void Engine::continue_membership(StepResult& out) {
+  if (!leading_ || continuing_) {
+    return;
+  }
+  RaiseFlag guard(continuing_);
+  const LogEntry* latest = nullptr;
+  for (const LogEntry& entry : log_) {
+    if (entry.kind == EntryKind::Membership) {
+      latest = &entry;
+    }
+  }
+  if (latest == nullptr || latest->id.index > commit_index_) {
+    return;
+  }
+  std::optional<Membership> decoded = Membership::decode(latest->data);
+  if (!decoded) {
+    return;
+  }
+  if (decoded->is_joint()) {
+    if (decoded->configs().size() != 2) {
+      return;
+    }
+    // The uniform target becomes effective when it is appended. It commits
+    // under that new config, which no longer requires the old voters.
+    const Membership uniform{decoded->configs()[1]};
+    append_local(out, EntryKind::Membership, uniform.encode());
+    return;
+  }
+  if (!decoded->contains(id_)) {
+    step_down();
+    campaign_.reset();
+    pre_campaign_.reset();
+  }
 }
 
 void Engine::establish_leader(StepResult& out) {
