@@ -42,21 +42,48 @@ RaftNode::RaftNode(NodeId id,
   restore_if_present();
 }
 
+namespace {
+
+bool membership_ok(const Membership& membership, NodeId self) {
+  if (self == 0 || membership.empty() || !membership.contains(self)) {
+    return false;
+  }
+  for (NodeId voter : membership.voters()) {
+    if (voter == 0) {
+      return false;
+    }
+  }
+  return true;
+}
+
+}  // namespace
+
 Result<void> RaftNode::initialize(Membership membership) {
+  if (failed_) {
+    return Result<void>::failure(Error::Storage);
+  }
   if (initialized_) {
     return Result<void>::failure(Error::AlreadyInitialized);
   }
-  if (membership.empty() || !membership.contains(id_)) {
+  if (!membership_ok(membership, id_)) {
     return Result<void>::failure(Error::InvalidMembership);
   }
-  check(storage_->save_membership(membership));
-  check(storage_->save_vote(Vote{}));
-  apply(engine_.recover(std::move(membership), Vote{}, {}));
+  try {
+    check(storage_->save_membership(membership));
+    check(storage_->save_vote(Vote{}));
+    apply(engine_.recover(std::move(membership), Vote{}, {}, state_machine_->last_applied()));
+  } catch (const std::runtime_error&) {
+    failed_ = true;
+    return Result<void>::failure(Error::Storage);
+  }
   initialized_ = true;
   return Result<void>::success();
 }
 
 Result<LogIndex> RaftNode::write(std::string data) {
+  if (failed_) {
+    return Result<LogIndex>::failure(Error::Storage);
+  }
   if (!initialized_) {
     return Result<LogIndex>::failure(Error::NotInitialized);
   }
@@ -67,19 +94,26 @@ Result<LogIndex> RaftNode::write(std::string data) {
   if (!proposed.accepted) {
     return Result<LogIndex>::failure(Error::NotLeader);
   }
-  apply(proposed.step);
+  try {
+    apply(proposed.step);
+  } catch (const std::runtime_error&) {
+    return Result<LogIndex>::failure(Error::Storage);
+  }
+  if (failed_) {
+    return Result<LogIndex>::failure(Error::Storage);
+  }
   return Result<LogIndex>::success(proposed.index);
 }
 
 void RaftNode::tick() {
-  if (!initialized_) {
+  if (failed_ || !initialized_) {
     return;
   }
   apply(engine_.on_tick());
 }
 
 void RaftNode::on_message(const Envelope& message) {
-  if (!initialized_) {
+  if (failed_ || !initialized_) {
     return;
   }
   dispatch(message);
@@ -93,26 +127,37 @@ void RaftNode::restore_if_present() {
   auto vote = check(storage_->load_vote());
   Vote restored = vote.value_or(Vote{});
   auto stored = check(storage_->read(1, UINT64_MAX));
-  apply(engine_.recover(std::move(*membership), restored, std::move(stored)));
+  const LogIndex already_applied = state_machine_ ? state_machine_->last_applied() : 0;
+  apply(engine_.recover(std::move(*membership), restored, std::move(stored), already_applied));
   initialized_ = true;
 }
 
 void RaftNode::apply(const StepResult& step) {
-  for (const Command& command : step.commands) {
-    switch (command.kind) {
-      case CommandKind::SaveVote:
-        check(storage_->save_vote(command.vote));
-        break;
-      case CommandKind::Truncate:
-        check(storage_->truncate_from(command.index));
-        break;
-      case CommandKind::Append:
-        check(storage_->append(command.entries));
-        break;
-      case CommandKind::Apply:
-        check(state_machine_->apply(command.entry));
-        break;
+  if (failed_) {
+    return;
+  }
+  try {
+    for (const Command& command : step.commands) {
+      switch (command.kind) {
+        case CommandKind::SaveVote:
+          check(storage_->save_vote(command.vote));
+          break;
+        case CommandKind::Truncate:
+          check(storage_->truncate_from(command.index));
+          break;
+        case CommandKind::Append:
+          check(storage_->append(command.entries));
+          break;
+        case CommandKind::Apply:
+          check(state_machine_->apply(command.entry));
+          break;
+      }
     }
+  } catch (const std::runtime_error&) {
+    // The engine shadow already moved. Refuse every later RPC and proposal so
+    // a retry cannot acknowledge state that never reached storage.
+    failed_ = true;
+    throw;
   }
   for (const Outbound& message : step.outbound) {
     send(message.to, message.payload);
@@ -137,9 +182,12 @@ void RaftNode::dispatch(const Envelope& message) {
         if constexpr (std::is_same_v<T, PreVoteRequest>) {
           VoteStep step = engine_.on_pre_vote(payload.body);
           apply(step.step);
-          send(message.from, PreVoteResponse{step.response});
+          PreVoteResponse response;
+          response.body = step.response;
+          response.probe = payload.probe;
+          send(message.from, response);
         } else if constexpr (std::is_same_v<T, PreVoteResponse>) {
-          apply(engine_.on_pre_vote_response(message.from, payload.body));
+          apply(engine_.on_pre_vote_response(message.from, payload));
         } else if constexpr (std::is_same_v<T, RequestVote>) {
           VoteStep step = engine_.on_vote(payload.body);
           apply(step.step);

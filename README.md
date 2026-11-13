@@ -45,7 +45,7 @@ A follower accepts AppendEntries only after it accepts the leader's vote. If `pr
 
 ## Build and test
 
-Requires CMake 3.20+, a C++20 compiler, and network access on the first configure so GoogleTest 1.15.2 can be fetched. No Boost and no other runtime dependencies.
+Requires CMake 3.24+, a C++20 compiler, and network access on the first configure so GoogleTest 1.15.2 can be fetched. No Boost and no other runtime dependencies. Voter ids start at 1; id 0 is reserved.
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug

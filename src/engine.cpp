@@ -48,13 +48,16 @@ Engine::Engine(NodeId id, Config config)
   next_election_at_ = election_timeout_ticks_;
 }
 
-StepResult Engine::recover(Membership membership, Vote vote, std::vector<LogEntry> log) {
+StepResult Engine::recover(Membership membership,
+                            Vote vote,
+                            std::vector<LogEntry> log,
+                            LogIndex already_applied) {
   StepResult out;
   membership_ = std::move(membership);
   log_ = std::move(log);
   last_index_ = log_.empty() ? 0 : log_.back().id.index;
   commit_index_ = 0;
-  last_applied_ = 0;
+  last_applied_ = already_applied > last_index_ ? last_index_ : already_applied;
   leading_ = false;
   role_ = Role::Follower;
   campaign_.reset();
@@ -131,12 +134,17 @@ VoteStep Engine::on_pre_vote(const VoteRequest& request) {
   return step;
 }
 
-StepResult Engine::on_pre_vote_response(NodeId from, const VoteResponse& response) {
+StepResult Engine::on_pre_vote_response(NodeId from, const PreVoteResponse& response) {
   StepResult out;
-  if (!pre_campaign_) {
+  // Only the fixed voter set can complete a probe, and only the probe that is
+  // still in flight. A delayed grant from the previous round is ignored.
+  if (!membership_.contains(from) || from == id_) {
     return out;
   }
-  if (response.granted) {
+  if (!pre_campaign_ || response.probe != pre_campaign_->probe) {
+    return out;
+  }
+  if (response.body.granted) {
     pre_campaign_->grants.insert(from);
     if (pre_campaign_->grants.size() >= membership_.quorum()) {
       elect(out);
@@ -144,12 +152,12 @@ StepResult Engine::on_pre_vote_response(NodeId from, const VoteResponse& respons
     return out;
   }
   // Their log is strictly ahead of ours; wait before campaigning again.
-  if (response.last_log_id && !log_is_up_to_date(last_log_id(), response.last_log_id)) {
+  if (response.body.last_log_id && !log_is_up_to_date(last_log_id(), response.body.last_log_id)) {
     next_election_at_ = now_ + election_timeout_ticks_;
   }
   // Catch up to a higher term without granting leadership or a lease.
-  if (response.vote > vote_) {
-    update_vote(out, response.vote.non_committed());
+  if (response.body.vote > vote_) {
+    update_vote(out, response.body.vote.non_committed());
   }
   return out;
 }
@@ -188,6 +196,9 @@ VoteStep Engine::on_vote(const VoteRequest& request) {
 
 StepResult Engine::on_vote_response(NodeId from, const VoteResponse& response) {
   StepResult out;
+  if (!membership_.contains(from) || from == id_) {
+    return out;
+  }
   if (!campaign_) {
     return out;
   }
@@ -435,6 +446,14 @@ void Engine::note_leader_contact() {
   ever_contacted_ = true;
   last_leader_contact_ = now_;
   next_election_at_ = now_ + election_timeout_ticks_;
+  // A heartbeat from the current leader cancels a probe that has not yet
+  // bumped the term. A delayed PreVote grant must not start an election.
+  const bool pending = campaign_.has_value() || pre_campaign_.has_value();
+  campaign_.reset();
+  pre_campaign_.reset();
+  if (pending && role_ == Role::Candidate) {
+    role_ = Role::Follower;
+  }
 }
 
 bool Engine::update_vote(StepResult& out, const Vote& incoming) {
@@ -531,38 +550,40 @@ void Engine::truncate_from(StepResult& out, LogIndex index) {
 }
 
 void Engine::advance_commit(StepResult& out) {
-  if (!leading_) {
+  if (!leading_ || membership_.empty()) {
     return;
   }
-  LogIndex newest = commit_index_;
-  for (LogIndex index = commit_index_ + 1; index <= last_index_; ++index) {
-    const LogEntry* entry = find(index);
-    if (entry == nullptr) {
-      break;
-    }
-    // Only this leader's entries may move the commit index. A committed
-    // entry of the current leader commits every preceding entry as well.
-    if (entry->id.term != vote_.leader.term || entry->id.node != id_) {
+  // The quorum-th largest match index is the highest index stored on a
+  // majority. Self is fully caught up. This is O(voters), not O(uncommitted^2).
+  std::vector<LogIndex> matched;
+  matched.reserve(membership_.size());
+  for (NodeId voter : membership_.voters()) {
+    if (voter == id_) {
+      matched.push_back(last_index_);
       continue;
     }
-    if (replica_count(index) >= membership_.quorum()) {
-      newest = index;
+    const auto found = progress_.find(voter);
+    matched.push_back(found == progress_.end() ? 0 : found->second.match_index);
+  }
+  std::sort(matched.begin(), matched.end());
+  const std::size_t quorum = membership_.quorum();
+  if (quorum == 0 || quorum > matched.size()) {
+    return;
+  }
+  const LogIndex majority_index = matched[matched.size() - quorum];
+  if (majority_index <= commit_index_) {
+    return;
+  }
+  // Only an entry from this leader may advance commit. Every index at or
+  // below majority_index is on a majority, so walk back to the newest such entry.
+  for (LogIndex index = majority_index; index > commit_index_; --index) {
+    const LogEntry* entry = find(index);
+    if (entry != nullptr && entry->id.term == vote_.leader.term && entry->id.node == id_) {
+      commit_index_ = index;
+      enqueue_applies(out);
+      return;
     }
   }
-  if (newest > commit_index_) {
-    commit_index_ = newest;
-    enqueue_applies(out);
-  }
-}
-
-std::size_t Engine::replica_count(LogIndex index) const {
-  std::size_t count = 1;
-  for (const auto& [node, progress] : progress_) {
-    if (membership_.contains(node) && progress.match_index >= index) {
-      ++count;
-    }
-  }
-  return count;
 }
 
 void Engine::replicate_all(StepResult& out) {
@@ -625,7 +646,10 @@ void Engine::send_vote_requests(StepResult& out, bool pre_vote, const Vote& vote
     Outbound message;
     message.to = voter;
     if (pre_vote) {
-      message.payload = PreVoteRequest{request};
+      PreVoteRequest wrapped;
+      wrapped.body = request;
+      wrapped.probe = pre_campaign_ ? pre_campaign_->probe : 0;
+      message.payload = std::move(wrapped);
     } else {
       message.payload = RequestVote{request};
     }
@@ -647,6 +671,7 @@ void Engine::pre_elect(StepResult& out) {
   Campaign campaign;
   campaign.vote = probed;
   campaign.grants.insert(id_);
+  campaign.probe = ++next_probe_;
   pre_campaign_ = campaign;
   if (pre_campaign_->grants.size() >= membership_.quorum()) {
     elect(out);

@@ -5,6 +5,7 @@
 
 #include "easyraft/types.hpp"
 
+#include <cstdint>
 #include <optional>
 #include <variant>
 #include <vector>
@@ -43,11 +44,15 @@ struct AppendEntriesResponse {
 };
 
 // Distinct wrappers so PreVote cannot be confused with a real RequestVote.
+// `probe` identifies one PreVote round. A delayed grant from an older round
+// must not be counted toward a later round that carries the same hypothetical vote.
 struct PreVoteRequest {
   VoteRequest body{};
+  std::uint64_t probe{0};
 };
 struct PreVoteResponse {
   VoteResponse body{};
+  std::uint64_t probe{0};
 };
 struct RequestVote {
   VoteRequest body{};

@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.20)
+cmake_minimum_required(VERSION 3.24)
 
 project(easyraft VERSION 0.1.0 LANGUAGES CXX)
 
@@ -35,6 +35,7 @@ if(BUILD_TESTING)
     tests/replication_test.cpp
     tests/persistence_test.cpp
     tests/partition_test.cpp
+    tests/node_test.cpp
   )
   target_link_libraries(easyraft_tests PRIVATE easyraft GTest::gtest_main)
   target_compile_features(easyraft_tests PRIVATE cxx_std_20)
@@ -44,10 +45,7 @@ if(BUILD_TESTING)
 endif()
 
 if(EASYRAFT_SANITIZERS)
-  foreach(target easyraft easyraft_tests)
-    if(TARGET ${target})
-      target_compile_options(${target} PRIVATE -fsanitize=address,undefined -fno-omit-frame-pointer)
-      target_link_options(${target} PRIVATE -fsanitize=address,undefined)
-    endif()
-  endforeach()
+  # PUBLIC so a static library still carries the runtime onto every consumer.
+  target_compile_options(easyraft PUBLIC -fsanitize=address,undefined -fno-omit-frame-pointer)
+  target_link_options(easyraft PUBLIC -fsanitize=address,undefined)
 endif()

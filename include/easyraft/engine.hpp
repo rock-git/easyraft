@@ -68,12 +68,17 @@ class Engine {
  public:
   Engine(NodeId id, Config config);
 
-  StepResult recover(Membership membership, Vote vote, std::vector<LogEntry> log);
+  // `already_applied` is the state machine's cursor. Entries at or below it are
+  // not emitted again when a leader re-commits the prefix.
+  StepResult recover(Membership membership,
+                     Vote vote,
+                     std::vector<LogEntry> log,
+                     LogIndex already_applied = 0);
   StepResult on_tick();
   ProposeResult propose(std::string data);
 
   VoteStep on_pre_vote(const VoteRequest& request);
-  StepResult on_pre_vote_response(NodeId from, const VoteResponse& response);
+  StepResult on_pre_vote_response(NodeId from, const PreVoteResponse& response);
   VoteStep on_vote(const VoteRequest& request);
   StepResult on_vote_response(NodeId from, const VoteResponse& response);
   AppendStep on_append(const AppendEntriesRequest& request);
@@ -100,6 +105,7 @@ class Engine {
   struct Campaign {
     Vote vote{};
     std::set<NodeId> grants;
+    std::uint64_t probe{0};
   };
 
   const LogEntry* find(LogIndex index) const;
@@ -114,7 +120,6 @@ class Engine {
   void append_local(StepResult& out, EntryKind kind, std::string data);
   void truncate_from(StepResult& out, LogIndex index);
   void advance_commit(StepResult& out);
-  std::size_t replica_count(LogIndex index) const;
   void replicate_all(StepResult& out);
   void send_append(StepResult& out, NodeId to);
   void send_vote_requests(StepResult& out, bool pre_vote, const Vote& vote);
@@ -143,6 +148,7 @@ class Engine {
   std::uint32_t rng_{1};
   std::optional<Campaign> campaign_;
   std::optional<Campaign> pre_campaign_;
+  std::uint64_t next_probe_{0};
   std::map<NodeId, Progress> progress_;
 };
 
