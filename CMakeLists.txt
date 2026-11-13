@@ -11,6 +11,7 @@ option(EASYRAFT_SANITIZERS "Build with AddressSanitizer and UndefinedBehaviorSan
 
 add_library(easyraft
   src/engine.cpp
+  src/file.cpp
   src/node.cpp
 )
 target_include_directories(easyraft PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
