@@ -95,7 +95,8 @@ class MemoryLogStorage final : public RaftLogStorage {
   std::vector<LogEntry> log_;
 };
 
-// Records committed application payloads. Blank entries advance the index only.
+// Records committed application payloads. Blank and membership entries advance
+// the index only.
 class MemoryStateMachine final : public RaftStateMachine {
  public:
   Result<void> apply(const LogEntry& entry) override {

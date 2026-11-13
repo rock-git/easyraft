@@ -45,11 +45,25 @@ RaftNode::RaftNode(NodeId id,
 namespace {
 
 bool membership_ok(const Membership& membership, NodeId self) {
-  if (self == 0 || membership.empty() || !membership.contains(self)) {
+  // The first config is uniform. This process may be absent from it so a new
+  // voter can catch up before a membership entry adds it. Id 0 stays reserved.
+  if (self == 0 || membership.empty() || membership.is_joint()) {
     return false;
   }
   for (NodeId voter : membership.voters()) {
     if (voter == 0) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool voter_ids_ok(const std::vector<NodeId>& voters) {
+  if (voters.empty()) {
+    return false;
+  }
+  for (NodeId id : voters) {
+    if (id == 0) {
       return false;
     }
   }
@@ -105,6 +119,37 @@ Result<LogIndex> RaftNode::write(std::string data) {
   return Result<LogIndex>::success(proposed.index);
 }
 
+Result<LogIndex> RaftNode::change_membership(std::vector<NodeId> voters) {
+  if (failed_) {
+    return Result<LogIndex>::failure(Error::Storage);
+  }
+  if (!initialized_) {
+    return Result<LogIndex>::failure(Error::NotInitialized);
+  }
+  if (role() != Role::Leader) {
+    return Result<LogIndex>::failure(Error::NotLeader);
+  }
+  if (!voter_ids_ok(voters)) {
+    return Result<LogIndex>::failure(Error::InvalidMembership);
+  }
+  if (engine_.membership_changing()) {
+    return Result<LogIndex>::failure(Error::Rejected);
+  }
+  ProposeResult proposed = engine_.change_membership(std::move(voters));
+  if (!proposed.accepted) {
+    return Result<LogIndex>::failure(Error::Rejected);
+  }
+  try {
+    apply(proposed.step);
+  } catch (const std::runtime_error&) {
+    return Result<LogIndex>::failure(Error::Storage);
+  }
+  if (failed_) {
+    return Result<LogIndex>::failure(Error::Storage);
+  }
+  return Result<LogIndex>::success(proposed.index);
+}
+
 void RaftNode::tick() {
   if (failed_ || !initialized_) {
     return;
@@ -141,6 +186,9 @@ void RaftNode::apply(const StepResult& step) {
       switch (command.kind) {
         case CommandKind::SaveVote:
           check(storage_->save_vote(command.vote));
+          break;
+        case CommandKind::SaveMembership:
+          check(storage_->save_membership(command.membership));
           break;
         case CommandKind::Truncate:
           check(storage_->truncate_from(command.index));

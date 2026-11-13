@@ -28,6 +28,10 @@ class RaftNode {
 
   Result<void> initialize(Membership membership);
   Result<LogIndex> write(std::string data);
+  // Only the leader starts a voter-set change. The joint entry is appended
+  // locally; the uniform target is appended once the joint entry commits.
+  // Returns the joint entry's index. An unchanged set returns the last index.
+  Result<LogIndex> change_membership(std::vector<NodeId> voters);
   void tick();
 
   void on_message(const Envelope& message);
@@ -37,6 +41,7 @@ class RaftNode {
   // is destroyed and rebuilt from storage.
   bool failed() const { return failed_; }
   NodeId id() const { return id_; }
+  const Membership& membership() const { return engine_.membership(); }
   Role role() const { return engine_.role(); }
   Term term() const { return engine_.term(); }
   const Vote& vote() const { return engine_.vote(); }
