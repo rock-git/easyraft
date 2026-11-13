@@ -21,18 +21,21 @@ namespace easyraft {
 //   log          append-only log
 //
 // `vote` and `membership` are replaced crash-safely: write `name.tmp`, fsync
-// the file, rename it onto `name`, and fsync the directory. A missing metadata
-// file loads as nullopt.
+// the file, rename it onto `name`, and fsync the directory. Creating the
+// directory also fsyncs each parent that gained a new entry. A missing
+// metadata file loads as nullopt.
 //
-// `log` starts with magic "ERLG" and version 1. Each record is
-// little-endian `uint32 body_len`, a body, and `uint32 crc32(body)`. The body
-// holds index, term, node, kind, data length, and data. `append` fsyncs the
-// file before success. `truncate_from` ftruncates the suffix and fsyncs.
+// `log` starts with magic "ERLG" and version 1. Each record is little-endian
+// `uint32 body_len`, `uint32 crc32` of those length bytes, a body, and
+// `uint32 crc32(body)`. The body holds index, term, node, kind, data length,
+// and data. `append` fsyncs the file before success. `truncate_from`
+// ftruncates the suffix and fsyncs.
 //
-// On open, a torn or checksum-failed final record is dropped. A checksum
-// failure earlier in the file, or any other I/O or integrity failure, returns
-// Error::Storage and leaves the bytes on disk alone. The commit index is not
-// stored.
+// On open, a final record is dropped only when its length checksum still
+// matches and the record is incomplete or its body checksum fails. A length
+// checksum mismatch is not a torn tail: open returns Error::Storage and
+// leaves the file unchanged. Any other integrity or I/O failure does the
+// same. The commit index is not stored.
 class FileLogStorage final : public RaftLogStorage {
  public:
   explicit FileLogStorage(std::filesystem::path directory);

@@ -355,6 +355,29 @@ TEST(FileLogStorage, CorruptLastChecksumIsDiscarded) {
   EXPECT_EQ(read_bytes(log_path).find("three"), std::string::npos);
 }
 
+TEST(FileLogStorage, CorruptLengthPrefixDoesNotTruncate) {
+  TempDir dir;
+  const auto log_path = dir.path() / "log";
+  {
+    FileLogStorage storage(dir.path());
+    ASSERT_TRUE(storage.append({app(1, "one"), app(2, "two"), app(3, "three")}).ok());
+  }
+  std::string bytes = read_bytes(log_path);
+  ASSERT_GT(bytes.size(), 16u);
+  const auto original_size = bytes.size();
+  // First record's body_len. Its length checksum stays put, so this is not a
+  // torn tail and must not swallow the later records.
+  bytes[8] = static_cast<char>(static_cast<unsigned char>(bytes[8]) ^ 0xffu);
+  write_bytes(log_path, bytes);
+
+  FileLogStorage storage(dir.path());
+  const auto failed = storage.read(1, 10);
+  EXPECT_FALSE(failed.ok());
+  EXPECT_EQ(failed.error(), Error::Storage);
+  EXPECT_EQ(std::filesystem::file_size(log_path), original_size);
+  EXPECT_NE(read_bytes(log_path).find("three"), std::string::npos);
+}
+
 TEST(FileLogStorage, MiddleChecksumFailureIsFatal) {
   TempDir dir;
   const auto log_path = dir.path() / "log";

@@ -77,7 +77,7 @@ auto index = node.write("value");
 
 On a multi-node cluster, pass a `MessageBus` and deliver envelopes back through `RaftNode::on_message`. `write` returns `Error::NotLeader` when the node cannot accept the proposal. `current_leader()` is the established leader, when this node knows one.
 
-`FileLogStorage` is the same `RaftLogStorage` contract, rooted at a directory. It stores `vote`, `membership`, and an append-only `log`. Metadata files are replaced with a temp file, fsync, rename, and a directory fsync. Log appends and truncations fsync before they return success. Opening the directory drops a torn or checksum-failed final record. The commit index is not stored, and this class does not snapshot or compact the log.
+`FileLogStorage` is the same `RaftLogStorage` contract, rooted at a directory. It stores `vote`, `membership`, and an append-only `log`. Metadata files are replaced with a temp file, fsync, rename, and a directory fsync. Creating the directory fsyncs each parent that gained a new entry. Log appends and truncations fsync before they return success. Opening the directory drops a torn or checksum-failed final record when its length checksum still matches. A corrupt length prefix is left on disk and reported as a storage error. The commit index is not stored, and this class does not snapshot or compact the log.
 
 ```cpp
 auto storage = std::make_shared<easyraft::FileLogStorage>("/var/lib/easyraft/1");
