@@ -134,6 +134,49 @@ class Cluster {
 
   void heal() { groups_.clear(); }
 
+  // Start a process that is not yet a voter. It is initialized with the first
+  // config of an existing node so it can accept the log prefix, and it does
+  // not campaign until a membership entry adds it.
+  void add_node(NodeId id) {
+    if (id == 0 || nodes_.find(id) != nodes_.end()) {
+      throw std::invalid_argument("cannot add node");
+    }
+    Config node_config = configs_.at(ids_.front());
+    node_config.election_timeout_min = 40;
+    node_config.election_timeout_max = 40;
+    node_config = node_config.normalized();
+    const Membership& current = nodes_.at(ids_.front())->membership();
+    if (current.configs().empty()) {
+      throw std::logic_error("cluster has no membership");
+    }
+    const Membership seed{current.configs().front()};
+
+    configs_.emplace(id, node_config);
+    if (storage_mode_ == StorageMode::File) {
+      const std::filesystem::path dir = root_ / std::to_string(id);
+      std::filesystem::create_directories(dir);
+      data_dirs_.emplace(id, dir);
+      stores_.emplace(id, std::make_shared<FileLogStorage>(dir));
+    } else {
+      stores_.emplace(id, std::make_shared<MemoryLogStorage>());
+    }
+    machines_.emplace(id, std::make_shared<MemoryStateMachine>());
+    running_.emplace(id, true);
+    nodes_.emplace(
+        id, std::make_unique<RaftNode>(id, node_config, stores_.at(id), machines_.at(id), &bus_));
+    bus_.bind(id, [this, id](const Envelope& message) {
+      if (!running_.at(id)) {
+        return;
+      }
+      nodes_.at(id)->on_message(message);
+    });
+    const Result<void> started = nodes_.at(id)->initialize(seed);
+    if (!started.ok()) {
+      throw std::runtime_error("add_node initialize failed");
+    }
+    ids_.push_back(id);
+  }
+
   void drop_append_responses(bool drop) { drop_append_responses_ = drop; }
 
   void stop(NodeId id) { running_.at(id) = false; }
