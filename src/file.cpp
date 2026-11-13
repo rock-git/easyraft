@@ -454,10 +454,12 @@ bool FileLogStorage::recover_log() {
   std::vector<LogEntry> entries;
   std::vector<std::uint64_t> offsets;
   std::uint64_t offset = kLogHeaderSize;
+  bool torn_tail = false;
   while (offset < file_size) {
     const std::uint64_t remaining = file_size - offset;
     if (remaining < 4) {
-      return false;
+      torn_tail = true;
+      break;
     }
     std::uint8_t len_bytes[4];
     if (!pread_all(log_fd_, len_bytes, sizeof len_bytes, offset)) {
@@ -468,7 +470,12 @@ bool FileLogStorage::recover_log() {
       return false;
     }
     const std::uint64_t need = 4ull + static_cast<std::uint64_t>(body_len) + 4ull;
-    if (need > remaining || body_len > kMaxRecordBody) {
+    if (need > remaining) {
+      // The length prefix runs past EOF. That is an incomplete final write.
+      torn_tail = true;
+      break;
+    }
+    if (body_len > kMaxRecordBody) {
       return false;
     }
     std::vector<std::uint8_t> body(body_len);
@@ -481,8 +488,14 @@ bool FileLogStorage::recover_log() {
     if (!read_u32(crc_bytes, sizeof crc_bytes, 0, stored_crc)) {
       return false;
     }
+    const bool last = offset + need == file_size;
     if (crc32(body.data(), body.size()) != stored_crc) {
-      return false;
+      if (!last) {
+        return false;
+      }
+      // A checksum mismatch on the last record is a torn or corrupted tail.
+      torn_tail = true;
+      break;
     }
     LogEntry entry;
     if (!decode_entry(body.data(), body_len, entry)) {
@@ -495,6 +508,13 @@ bool FileLogStorage::recover_log() {
     offsets.push_back(offset);
     entries.push_back(std::move(entry));
     offset += need;
+  }
+
+  if (torn_tail) {
+    if (offset > static_cast<std::uint64_t>(std::numeric_limits<off_t>::max()) ||
+        ftruncate_retry(log_fd_, static_cast<off_t>(offset)) != 0 || fsync_retry(log_fd_) != 0) {
+      return false;
+    }
   }
 
   log_ = std::move(entries);
