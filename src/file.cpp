@@ -26,6 +26,8 @@ constexpr std::uint32_t kLogMagic = 0x474C5245u;          // 'ERLG'
 constexpr std::uint32_t kVersion = 1u;
 constexpr std::uint64_t kLogHeaderSize = 8;
 constexpr std::size_t kVoteBytes = 29;
+constexpr std::uint32_t kMaxRecordBody = 32u * 1024u * 1024u;
+constexpr std::uint32_t kEntryPrefix = 29u;
 constexpr std::uint32_t kMaxVoters = 100000u;
 constexpr std::uint64_t kMaxMetaBytes = 1u << 20;
 
@@ -306,6 +308,61 @@ std::optional<Membership> decode_membership(const std::string& bytes) {
   return Membership{std::move(voters)};
 }
 
+std::optional<std::string> encode_record(const LogEntry& entry) {
+  if (entry.data.size() > static_cast<std::size_t>(kMaxRecordBody - kEntryPrefix)) {
+    return std::nullopt;
+  }
+  std::uint8_t kind = 0;
+  if (entry.kind == EntryKind::Blank) {
+    kind = 0;
+  } else if (entry.kind == EntryKind::Application) {
+    kind = 1;
+  } else {
+    return std::nullopt;
+  }
+  std::string body;
+  body.reserve(static_cast<std::size_t>(kEntryPrefix) + entry.data.size());
+  append_u64(body, entry.id.index);
+  append_u64(body, entry.id.term);
+  append_u64(body, entry.id.node);
+  append_u8(body, kind);
+  append_u32(body, static_cast<std::uint32_t>(entry.data.size()));
+  body.append(entry.data);
+
+  std::string out;
+  out.reserve(4 + body.size() + 4);
+  append_u32(out, static_cast<std::uint32_t>(body.size()));
+  const std::uint32_t sum = crc32(body);
+  out.append(body);
+  append_u32(out, sum);
+  return out;
+}
+
+bool decode_entry(const std::uint8_t* body, std::uint32_t body_len, LogEntry& entry) {
+  if (body_len < kEntryPrefix) {
+    return false;
+  }
+  std::uint64_t index = 0;
+  std::uint64_t term = 0;
+  std::uint64_t node = 0;
+  std::uint32_t data_len = 0;
+  if (!read_u64(body, body_len, 0, index) || !read_u64(body, body_len, 8, term) ||
+      !read_u64(body, body_len, 16, node) || !read_u32(body, body_len, 25, data_len)) {
+    return false;
+  }
+  const std::uint8_t kind = body[24];
+  if (kind > 1) {
+    return false;
+  }
+  if (static_cast<std::uint64_t>(kEntryPrefix) + data_len != body_len) {
+    return false;
+  }
+  entry.id = LogId{term, node, index};
+  entry.kind = kind == 0 ? EntryKind::Blank : EntryKind::Application;
+  entry.data.assign(reinterpret_cast<const char*>(body + kEntryPrefix), data_len);
+  return true;
+}
+
 }  // namespace
 
 FileLogStorage::FileLogStorage(std::filesystem::path directory) {
@@ -353,29 +410,7 @@ bool FileLogStorage::open_log() {
   if (log_fd_ < 0) {
     return false;
   }
-  struct stat st {};
-  if (::fstat(log_fd_, &st) != 0 || st.st_size < 0) {
-    return false;
-  }
-  const auto file_size = static_cast<std::uint64_t>(st.st_size);
-  if (file_size == 0) {
-    return write_log_header();
-  }
-  if (file_size != kLogHeaderSize) {
-    return false;
-  }
-  std::uint8_t header[8];
-  if (!pread_all(log_fd_, header, sizeof header, 0)) {
-    return false;
-  }
-  std::uint32_t magic = 0;
-  std::uint32_t version = 0;
-  if (!read_u32(header, sizeof header, 0, magic) || !read_u32(header, sizeof header, 4, version) ||
-      magic != kLogMagic || version != kVersion) {
-    return false;
-  }
-  end_offset_ = kLogHeaderSize;
-  return true;
+  return recover_log();
 }
 
 bool FileLogStorage::write_log_header() {
@@ -390,6 +425,81 @@ bool FileLogStorage::write_log_header() {
   log_.clear();
   offsets_.clear();
   end_offset_ = kLogHeaderSize;
+  return true;
+}
+
+bool FileLogStorage::recover_log() {
+  struct stat st {};
+  if (::fstat(log_fd_, &st) != 0 || st.st_size < 0) {
+    return false;
+  }
+  const auto file_size = static_cast<std::uint64_t>(st.st_size);
+  if (file_size < kLogHeaderSize) {
+    // A crash while creating the file leaves a short header. The log never
+    // held a complete record, so rewrite an empty one.
+    return write_log_header();
+  }
+
+  std::uint8_t header[kLogHeaderSize];
+  if (!pread_all(log_fd_, header, sizeof header, 0)) {
+    return false;
+  }
+  std::uint32_t magic = 0;
+  std::uint32_t version = 0;
+  if (!read_u32(header, sizeof header, 0, magic) || !read_u32(header, sizeof header, 4, version) ||
+      magic != kLogMagic || version != kVersion) {
+    return false;
+  }
+
+  std::vector<LogEntry> entries;
+  std::vector<std::uint64_t> offsets;
+  std::uint64_t offset = kLogHeaderSize;
+  while (offset < file_size) {
+    const std::uint64_t remaining = file_size - offset;
+    if (remaining < 4) {
+      return false;
+    }
+    std::uint8_t len_bytes[4];
+    if (!pread_all(log_fd_, len_bytes, sizeof len_bytes, offset)) {
+      return false;
+    }
+    std::uint32_t body_len = 0;
+    if (!read_u32(len_bytes, sizeof len_bytes, 0, body_len)) {
+      return false;
+    }
+    const std::uint64_t need = 4ull + static_cast<std::uint64_t>(body_len) + 4ull;
+    if (need > remaining || body_len > kMaxRecordBody) {
+      return false;
+    }
+    std::vector<std::uint8_t> body(body_len);
+    std::uint8_t crc_bytes[4];
+    if (!pread_all(log_fd_, body.data(), body.size(), offset + 4) ||
+        !pread_all(log_fd_, crc_bytes, sizeof crc_bytes, offset + 4 + body_len)) {
+      return false;
+    }
+    std::uint32_t stored_crc = 0;
+    if (!read_u32(crc_bytes, sizeof crc_bytes, 0, stored_crc)) {
+      return false;
+    }
+    if (crc32(body.data(), body.size()) != stored_crc) {
+      return false;
+    }
+    LogEntry entry;
+    if (!decode_entry(body.data(), body_len, entry)) {
+      return false;
+    }
+    const LogIndex expected = static_cast<LogIndex>(entries.size()) + 1;
+    if (entry.id.index != expected) {
+      return false;
+    }
+    offsets.push_back(offset);
+    entries.push_back(std::move(entry));
+    offset += need;
+  }
+
+  log_ = std::move(entries);
+  offsets_ = std::move(offsets);
+  end_offset_ = offset;
   return true;
 }
 
@@ -486,27 +596,104 @@ Result<std::optional<Membership>> FileLogStorage::load_membership() {
 }
 
 Result<void> FileLogStorage::append(const std::vector<LogEntry>& entries) {
-  if (failed_ || log_fd_ < 0) {
+  if (failed_ || log_fd_ < 0 || end_offset_ < kLogHeaderSize) {
     return storage_error();
   }
-  if (!entries.empty()) {
+  if (entries.empty()) {
+    return Result<void>::success();
+  }
+  const LogIndex base = static_cast<LogIndex>(log_.size()) + 1;
+  if (entries.front().id.index != base) {
+    return storage_error();
+  }
+  for (std::size_t i = 0; i < entries.size(); ++i) {
+    if (entries[i].id.index != base + static_cast<LogIndex>(i)) {
+      return storage_error();
+    }
+  }
+
+  std::string buffer;
+  std::vector<std::uint64_t> new_offsets;
+  new_offsets.reserve(entries.size());
+  std::uint64_t cursor = end_offset_;
+  for (const LogEntry& entry : entries) {
+    auto encoded = encode_record(entry);
+    if (!encoded) {
+      return storage_error();
+    }
+    if (encoded->size() > std::numeric_limits<std::uint64_t>::max() - cursor) {
+      return storage_error();
+    }
+    new_offsets.push_back(cursor);
+    cursor += encoded->size();
+    buffer.append(*encoded);
+  }
+
+  auto rollback = [this]() {
+    if (end_offset_ > static_cast<std::uint64_t>(std::numeric_limits<off_t>::max()) ||
+        ftruncate_retry(log_fd_, static_cast<off_t>(end_offset_)) != 0 ||
+        fsync_retry(log_fd_) != 0) {
+      failed_ = true;
+    }
+  };
+  if (!pwrite_all(log_fd_, buffer.data(), buffer.size(), end_offset_)) {
+    rollback();
+    return storage_error();
+  }
+  // Success means the new records survive a crash.
+  if (fsync_retry(log_fd_) != 0) {
+    rollback();
+    return storage_error();
+  }
+  log_.insert(log_.end(), entries.begin(), entries.end());
+  offsets_.insert(offsets_.end(), new_offsets.begin(), new_offsets.end());
+  end_offset_ = cursor;
+  return Result<void>::success();
+}
+
+Result<void> FileLogStorage::truncate_from(LogIndex index) {
+  if (failed_ || log_fd_ < 0 || end_offset_ < kLogHeaderSize) {
+    return storage_error();
+  }
+  if (index > log_.size()) {
+    return Result<void>::success();
+  }
+  const std::size_t keep = index == 0 ? 0 : static_cast<std::size_t>(index - 1);
+  const std::uint64_t new_end =
+      index == 0 ? kLogHeaderSize : offsets_[static_cast<std::size_t>(index - 1)];
+  if (new_end < kLogHeaderSize || new_end > end_offset_) {
+    return storage_error();
+  }
+  if (new_end == end_offset_ && keep == log_.size()) {
+    return Result<void>::success();
+  }
+  if (new_end > static_cast<std::uint64_t>(std::numeric_limits<off_t>::max()) ||
+      ftruncate_retry(log_fd_, static_cast<off_t>(new_end)) != 0) {
+    return storage_error();
+  }
+  log_.resize(keep);
+  offsets_.resize(keep);
+  end_offset_ = new_end;
+  if (fsync_retry(log_fd_) != 0) {
     return storage_error();
   }
   return Result<void>::success();
 }
 
-Result<void> FileLogStorage::truncate_from(LogIndex) {
-  if (failed_ || log_fd_ < 0) {
-    return storage_error();
-  }
-  return Result<void>::success();
-}
-
-Result<std::vector<LogEntry>> FileLogStorage::read(LogIndex, LogIndex) {
+Result<std::vector<LogEntry>> FileLogStorage::read(LogIndex from, LogIndex to) {
   if (failed_) {
     return Result<std::vector<LogEntry>>::failure(Error::Storage);
   }
-  return Result<std::vector<LogEntry>>::success({});
+  if (from == 0 || from > to || from > log_.size()) {
+    return Result<std::vector<LogEntry>>::success({});
+  }
+  const LogIndex last = std::min(to, static_cast<LogIndex>(log_.size()));
+  std::vector<LogEntry> out;
+  out.reserve(static_cast<std::size_t>(last - from + 1));
+  for (LogIndex i = from; i <= last; ++i) {
+    out.push_back(log_[static_cast<std::size_t>(i - 1)]);
+  }
+  return Result<std::vector<LogEntry>>::success(std::move(out));
 }
 
 }  // namespace easyraft
