@@ -5,6 +5,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <filesystem>
@@ -434,6 +435,121 @@ TEST(EngineSnapshot, ConflictingSnapshotDropsTheSuffix) {
     }
   }
   EXPECT_TRUE(truncated);
+}
+
+std::uint64_t prevote_probe(const StepResult& step) {
+  for (const Outbound& message : step.outbound) {
+    if (const auto* request = std::get_if<PreVoteRequest>(&message.payload)) {
+      return request->probe;
+    }
+  }
+  return 0;
+}
+
+void become_leader(Engine& engine) {
+  std::uint64_t probe = 0;
+  for (int tick = 0; tick < 8 && engine.role() != Role::Leader; ++tick) {
+    probe = std::max(probe, prevote_probe(engine.on_tick()));
+    if (probe != 0 && engine.role() != Role::Leader && engine.term() == 0) {
+      PreVoteResponse grant;
+      grant.probe = probe;
+      grant.body.granted = true;
+      engine.on_pre_vote_response(2, grant);
+    }
+    if (engine.role() == Role::Candidate) {
+      VoteResponse vote;
+      vote.granted = true;
+      vote.vote = engine.vote();
+      engine.on_vote_response(2, vote);
+    }
+  }
+}
+
+void ack_from(Engine& engine, NodeId from) {
+  AppendEntriesResponse response;
+  response.success = true;
+  response.request_vote = engine.vote();
+  response.responder_vote = engine.vote().non_committed();
+  response.match_index = engine.last_index();
+  engine.on_append_response(from, response);
+}
+
+bool sends_current_snapshot(const StepResult& step, NodeId to, LogIndex index) {
+  bool saw = false;
+  for (const Outbound& message : step.outbound) {
+    if (message.to != to) {
+      continue;
+    }
+    if (std::holds_alternative<AppendEntriesRequest>(message.payload)) {
+      return false;
+    }
+    if (const auto* request = std::get_if<InstallSnapshotRequest>(&message.payload)) {
+      if (request->meta.last_included.index != index) {
+        return false;
+      }
+      saw = true;
+    }
+  }
+  return saw;
+}
+
+TEST(EngineSnapshot, InstallReplyDoesNotSkipANewerLocalSnapshot) {
+  Engine engine(1, pinned(4));
+  engine.recover(Membership{{1, 2, 3}}, Vote{}, {});
+  become_leader(engine);
+  ASSERT_EQ(engine.role(), Role::Leader);
+
+  ASSERT_TRUE(engine.propose("one").accepted);
+  ack_from(engine, 2);
+  ASSERT_TRUE(engine.propose("two").accepted);
+  ack_from(engine, 2);
+  const SnapshotBuild first = engine.begin_snapshot();
+  ASSERT_TRUE(first.started);
+  const LogIndex first_index = engine.compacted_index();
+  engine.store_snapshot_bytes("first");
+
+  ASSERT_TRUE(engine.propose("three").accepted);
+  ack_from(engine, 2);
+  const SnapshotBuild second = engine.begin_snapshot();
+  ASSERT_TRUE(second.started);
+  const LogIndex second_index = engine.compacted_index();
+  ASSERT_GT(second_index, first_index);
+  engine.store_snapshot_bytes("second");
+
+  InstallSnapshotResponse installed;
+  installed.success = true;
+  installed.installed = true;
+  installed.request_vote = engine.vote();
+  installed.responder_vote = engine.vote().non_committed();
+  installed.follower_index = first_index;
+  const StepResult followed = engine.on_install_response(3, installed);
+  EXPECT_TRUE(sends_current_snapshot(followed, 3, second_index)) << engine.debug();
+
+  InstallSnapshotResponse stale;
+  stale.stale = true;
+  stale.request_vote = engine.vote();
+  stale.responder_vote = engine.vote().non_committed();
+  stale.follower_index = first_index;
+  Engine other(1, pinned(4));
+  other.recover(Membership{{1, 2, 3}}, Vote{}, {});
+  become_leader(other);
+  ASSERT_TRUE(other.propose("one").accepted);
+  ack_from(other, 2);
+  ASSERT_TRUE(other.propose("two").accepted);
+  ack_from(other, 2);
+  ASSERT_TRUE(other.begin_snapshot().started);
+  const LogIndex stale_index = other.compacted_index();
+  other.store_snapshot_bytes("first");
+  ASSERT_TRUE(other.propose("three").accepted);
+  ack_from(other, 2);
+  ASSERT_TRUE(other.begin_snapshot().started);
+  const LogIndex newer_index = other.compacted_index();
+  other.store_snapshot_bytes("second");
+  stale.follower_index = stale_index;
+  stale.request_vote = other.vote();
+  stale.responder_vote = other.vote().non_committed();
+  const StepResult ignored = other.on_install_response(3, stale);
+  EXPECT_TRUE(sends_current_snapshot(ignored, 3, newer_index)) << other.debug();
 }
 
 TEST(EngineSnapshot, LeaderSendsSnapshotToANewVoter) {
