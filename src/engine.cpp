@@ -146,7 +146,7 @@ StepResult Engine::on_pre_vote_response(NodeId from, const PreVoteResponse& resp
   }
   if (response.body.granted) {
     pre_campaign_->grants.insert(from);
-    if (pre_campaign_->grants.size() >= membership_.quorum()) {
+    if (has_quorum(pre_campaign_->grants)) {
       elect(out);
     }
     return out;
@@ -204,7 +204,7 @@ StepResult Engine::on_vote_response(NodeId from, const VoteResponse& response) {
   }
   if (response.granted && response.vote == campaign_->vote) {
     campaign_->grants.insert(from);
-    if (campaign_->grants.size() >= membership_.quorum()) {
+    if (has_quorum(campaign_->grants)) {
       establish_leader(out);
     }
     return out;
@@ -428,18 +428,14 @@ bool Engine::leader_quorum_lease_valid() const {
   if (!leading_) {
     return false;
   }
-  std::size_t fresh = 0;
-  for (NodeId voter : membership_.voters()) {
+  return membership_.is_quorum([&](NodeId voter) {
     if (voter == id_) {
-      ++fresh;
-      continue;
+      return true;
     }
     const auto found = progress_.find(voter);
-    if (found != progress_.end() && now_ - found->second.last_ack_tick < election_timeout_ticks_) {
-      ++fresh;
-    }
-  }
-  return fresh >= membership_.quorum();
+    return found != progress_.end() &&
+           now_ - found->second.last_ack_tick < election_timeout_ticks_;
+  });
 }
 
 void Engine::note_leader_contact() {
@@ -549,31 +545,53 @@ void Engine::truncate_from(StepResult& out, LogIndex index) {
   out.commands.push_back(truncate_command(index));
 }
 
+bool Engine::has_quorum(const std::set<NodeId>& grants) const {
+  return membership_.is_quorum([&](NodeId id) { return grants.find(id) != grants.end(); });
+}
+
+std::optional<LogIndex> Engine::quorum_match_index() const {
+  if (membership_.configs().empty()) {
+    return std::nullopt;
+  }
+  std::optional<LogIndex> agreed;
+  for (const std::vector<NodeId>& config : membership_.configs()) {
+    if (config.empty()) {
+      return std::nullopt;
+    }
+    std::vector<LogIndex> matched;
+    matched.reserve(config.size());
+    for (NodeId voter : config) {
+      if (voter == id_) {
+        matched.push_back(last_index_);
+      } else {
+        const auto found = progress_.find(voter);
+        matched.push_back(found == progress_.end() ? 0 : found->second.match_index);
+      }
+    }
+    std::sort(matched.begin(), matched.end());
+    const std::size_t need = config.size() / 2 + 1;
+    if (need == 0 || need > matched.size()) {
+      return std::nullopt;
+    }
+    const LogIndex majority = matched[matched.size() - need];
+    if (!agreed || majority < *agreed) {
+      agreed = majority;
+    }
+  }
+  return agreed;
+}
+
 void Engine::advance_commit(StepResult& out) {
   if (!leading_ || membership_.empty()) {
     return;
   }
-  // The quorum-th largest match index is the highest index stored on a
-  // majority. Self is fully caught up. This is O(voters), not O(uncommitted^2).
-  std::vector<LogIndex> matched;
-  matched.reserve(membership_.size());
-  for (NodeId voter : membership_.voters()) {
-    if (voter == id_) {
-      matched.push_back(last_index_);
-      continue;
-    }
-    const auto found = progress_.find(voter);
-    matched.push_back(found == progress_.end() ? 0 : found->second.match_index);
-  }
-  std::sort(matched.begin(), matched.end());
-  const std::size_t quorum = membership_.quorum();
-  if (quorum == 0 || quorum > matched.size()) {
+  // The highest index stored on a majority of every config. Self is fully
+  // caught up. One pass over the voters, not over the uncommitted suffix.
+  const std::optional<LogIndex> agreed = quorum_match_index();
+  if (!agreed || *agreed <= commit_index_) {
     return;
   }
-  const LogIndex majority_index = matched[matched.size() - quorum];
-  if (majority_index <= commit_index_) {
-    return;
-  }
+  const LogIndex majority_index = *agreed;
   // Only an entry from this leader may advance commit. Every index at or
   // below majority_index is on a majority, so walk back to the newest such entry.
   for (LogIndex index = majority_index; index > commit_index_; --index) {
@@ -673,7 +691,7 @@ void Engine::pre_elect(StepResult& out) {
   campaign.grants.insert(id_);
   campaign.probe = ++next_probe_;
   pre_campaign_ = campaign;
-  if (pre_campaign_->grants.size() >= membership_.quorum()) {
+  if (has_quorum(pre_campaign_->grants)) {
     elect(out);
     return;
   }
@@ -700,7 +718,7 @@ void Engine::elect(StepResult& out) {
   if (!campaign_) {
     return;
   }
-  if (campaign_->grants.size() >= membership_.quorum()) {
+  if (has_quorum(campaign_->grants)) {
     establish_leader(out);
     return;
   }
