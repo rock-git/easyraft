@@ -290,8 +290,7 @@ std::optional<Vote> decode_vote(const std::string& bytes) {
   return vote;
 }
 
-std::optional<std::string> encode_membership(const Membership& membership) {
-  const std::vector<NodeId>& voters = membership.voters();
+std::optional<std::string> encode_uniform_membership(const std::vector<NodeId>& voters) {
   if (voters.size() > kMaxVoters) {
     return std::nullopt;
   }
@@ -308,6 +307,65 @@ std::optional<std::string> encode_membership(const Membership& membership) {
   return out;
 }
 
+std::optional<std::string> encode_membership(const Membership& membership) {
+  // Version 1 stays the single sorted voter list so files written before
+  // joint consensus still match what a uniform config writes now.
+  if (!membership.is_joint()) {
+    return encode_uniform_membership(membership.voters());
+  }
+  const std::vector<std::vector<NodeId>>& configs = membership.configs();
+  if (configs.size() != 2) {
+    return std::nullopt;
+  }
+  std::size_t id_count = 0;
+  for (const std::vector<NodeId>& config : configs) {
+    if (config.size() > kMaxVoters) {
+      return std::nullopt;
+    }
+    id_count += config.size();
+  }
+  std::string out;
+  out.reserve(16 + id_count * 8 + configs.size() * 4 + 4);
+  append_u32(out, kMembershipMagic);
+  append_u32(out, 2u);
+  append_u32(out, static_cast<std::uint32_t>(configs.size()));
+  for (const std::vector<NodeId>& config : configs) {
+    append_u32(out, static_cast<std::uint32_t>(config.size()));
+    for (NodeId id : config) {
+      append_u64(out, id);
+    }
+  }
+  const std::uint32_t sum = crc32(out);
+  append_u32(out, sum);
+  return out;
+}
+
+std::optional<Membership> decode_uniform_membership(const std::uint8_t* data,
+                                                    std::size_t size,
+                                                    std::uint32_t count) {
+  if (count > kMaxVoters) {
+    return std::nullopt;
+  }
+  const std::size_t expect = 12 + static_cast<std::size_t>(count) * 8 + 4;
+  if (size != expect) {
+    return std::nullopt;
+  }
+  std::uint32_t stored = 0;
+  if (!read_u32(data, size, expect - 4, stored) || crc32(data, expect - 4) != stored) {
+    return std::nullopt;
+  }
+  std::vector<NodeId> voters;
+  voters.reserve(count);
+  for (std::uint32_t i = 0; i < count; ++i) {
+    std::uint64_t id = 0;
+    if (!read_u64(data, size, 12 + static_cast<std::size_t>(i) * 8, id)) {
+      return std::nullopt;
+    }
+    voters.push_back(id);
+  }
+  return Membership{std::move(voters)};
+}
+
 std::optional<Membership> decode_membership(const std::string& bytes) {
   if (bytes.size() < 16) {
     return std::nullopt;
@@ -320,27 +378,50 @@ std::optional<Membership> decode_membership(const std::string& bytes) {
       !read_u32(data, bytes.size(), 8, count)) {
     return std::nullopt;
   }
-  if (magic != kMembershipMagic || version != kVersion || count > kMaxVoters) {
+  if (magic != kMembershipMagic) {
     return std::nullopt;
   }
-  const std::size_t expect = 12 + static_cast<std::size_t>(count) * 8 + 4;
-  if (bytes.size() != expect) {
+  if (version == kVersion) {
+    return decode_uniform_membership(data, bytes.size(), count);
+  }
+  if (version != 2u || count < 1 || count > 2) {
+    return std::nullopt;
+  }
+  std::size_t offset = 12;
+  std::vector<std::vector<NodeId>> configs;
+  configs.reserve(count);
+  for (std::uint32_t config_index = 0; config_index < count; ++config_index) {
+    std::uint32_t voters = 0;
+    if (!read_u32(data, bytes.size(), offset, voters) || voters > kMaxVoters) {
+      return std::nullopt;
+    }
+    offset += 4;
+    if (bytes.size() - offset < static_cast<std::size_t>(voters) * 8 + 4) {
+      return std::nullopt;
+    }
+    std::vector<NodeId> ids;
+    ids.reserve(voters);
+    for (std::uint32_t i = 0; i < voters; ++i) {
+      std::uint64_t id = 0;
+      if (!read_u64(data, bytes.size(), offset, id)) {
+        return std::nullopt;
+      }
+      offset += 8;
+      ids.push_back(id);
+    }
+    configs.push_back(std::move(ids));
+  }
+  if (bytes.size() != offset + 4) {
     return std::nullopt;
   }
   std::uint32_t stored = 0;
-  if (!read_u32(data, bytes.size(), expect - 4, stored) || crc32(data, expect - 4) != stored) {
+  if (!read_u32(data, bytes.size(), offset, stored) || crc32(data, offset) != stored) {
     return std::nullopt;
   }
-  std::vector<NodeId> voters;
-  voters.reserve(count);
-  for (std::uint32_t i = 0; i < count; ++i) {
-    std::uint64_t id = 0;
-    if (!read_u64(data, bytes.size(), 12 + static_cast<std::size_t>(i) * 8, id)) {
-      return std::nullopt;
-    }
-    voters.push_back(id);
+  if (configs.size() == 1) {
+    return Membership{std::move(configs[0])};
   }
-  return Membership{std::move(voters)};
+  return Membership::joint_of(std::move(configs[0]), std::move(configs[1]));
 }
 
 std::optional<std::string> encode_record(const LogEntry& entry) {
@@ -355,6 +436,8 @@ std::optional<std::string> encode_record(const LogEntry& entry) {
     kind = 0;
   } else if (entry.kind == EntryKind::Application) {
     kind = 1;
+  } else if (entry.kind == EntryKind::Membership) {
+    kind = 2;
   } else {
     return std::nullopt;
   }
@@ -393,14 +476,20 @@ bool decode_entry(const std::uint8_t* body, std::uint32_t body_len, LogEntry& en
     return false;
   }
   const std::uint8_t kind = body[24];
-  if (kind > 1) {
+  if (kind > 2) {
     return false;
   }
   if (static_cast<std::uint64_t>(kEntryPrefix) + data_len != body_len) {
     return false;
   }
   entry.id = LogId{term, node, index};
-  entry.kind = kind == 0 ? EntryKind::Blank : EntryKind::Application;
+  if (kind == 0) {
+    entry.kind = EntryKind::Blank;
+  } else if (kind == 1) {
+    entry.kind = EntryKind::Application;
+  } else {
+    entry.kind = EntryKind::Membership;
+  }
   entry.data.assign(reinterpret_cast<const char*>(body + kEntryPrefix), data_len);
   return true;
 }

@@ -13,7 +13,8 @@ namespace easyraft {
 
 // Persistent Raft log and hard state.
 //
-// Phase 1 persists the vote, the fixed membership, and the log. The commit
+// Persists the vote, the membership (one uniform config or a joint pair), and
+// the log. The commit
 // index is not persisted: after a restart the node is a follower and a leader
 // re-commits the prefix. Truncation deletes the suffix starting at `index`
 // (inclusive) and must not be paired with a blind delete-then-append of a

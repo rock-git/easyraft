@@ -17,7 +17,7 @@ namespace easyraft {
 //
 // Layout:
 //   vote         current vote
-//   membership   current voter set
+//   membership   current uniform or joint voter config
 //   log          append-only log
 //
 // `vote` and `membership` are replaced crash-safely: write `name.tmp`, fsync
@@ -25,11 +25,17 @@ namespace easyraft {
 // directory also fsyncs each parent that gained a new entry. A missing
 // metadata file loads as nullopt.
 //
+// A uniform membership is still the version-1 record: magic, version 1,
+// voter count, voter ids, crc32. A joint membership is version 2: magic,
+// version 2, config count (2), then each config's count and ids, then crc32.
+// Version 1 files load as a uniform membership.
+//
 // `log` starts with magic "ERLG" and version 1. Each record is little-endian
 // `uint32 body_len`, `uint32 crc32` of those length bytes, a body, and
 // `uint32 crc32(body)`. The body holds index, term, node, kind, data length,
-// and data. `append` fsyncs the file before success. `truncate_from`
-// ftruncates the suffix and fsyncs.
+// and data. Kind 0 is blank, 1 is application, and 2 is membership (`data`
+// is the membership encoding). `append` fsyncs the file before success.
+// `truncate_from` ftruncates the suffix and fsyncs.
 //
 // On open, a final record is dropped only when its length checksum still
 // matches and the record is incomplete or its body checksum fails. A length
