@@ -4,6 +4,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 
 namespace easyraft {
 
@@ -16,6 +17,14 @@ struct Config {
   int election_timeout_max{20};
   bool enable_pre_vote{true};
   std::size_t max_append_entries{64};
+  // Applied entries past the current snapshot before this node compacts.
+  // Zero disables automatic snapshots, so tests that never opt in keep the
+  // full log. A follower may cross the threshold; sending the result is
+  // still leader-only.
+  std::uint64_t snapshot_threshold{0};
+  // Largest snapshot payload in one InstallSnapshot request. Zero sends the
+  // whole image in a single request.
+  std::size_t max_snapshot_chunk{0};
 
   Config normalized() const {
     Config copy = *this;

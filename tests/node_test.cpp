@@ -48,6 +48,10 @@ class FailAfterAppends final : public RaftLogStorage {
     return inner_.append(entries);
   }
 
+  Result<void> save_snapshot(const Snapshot& snapshot) override { return inner_.save_snapshot(snapshot); }
+  Result<std::optional<Snapshot>> load_snapshot() override { return inner_.load_snapshot(); }
+  Result<void> purge_through(LogIndex index) override { return inner_.purge_through(index); }
+
   Result<void> truncate_from(LogIndex index) override { return inner_.truncate_from(index); }
   Result<std::vector<LogEntry>> read(LogIndex from, LogIndex to) override { return inner_.read(from, to); }
 
@@ -72,6 +76,19 @@ class CursorStateMachine final : public RaftStateMachine {
   }
 
   LogIndex last_applied() const override { return last_; }
+
+  Result<std::string> build_snapshot() override {
+    return Result<std::string>::success(std::string{});
+  }
+
+  Result<void> install_snapshot(const SnapshotMeta& meta, std::string_view) override {
+    if (meta.last_included.index < last_) {
+      return Result<void>::failure(Error::Rejected);
+    }
+    last_ = meta.last_included.index;
+    return Result<void>::success();
+  }
+
   std::vector<LogIndex> seen;
 
  private:
