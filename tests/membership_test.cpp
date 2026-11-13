@@ -401,9 +401,13 @@ TEST_P(MembershipRestart, RecoversDuringAndAfterAChange) {
   EXPECT_EQ(cluster.machine(4).data().front(), "resumed");
 }
 
-INSTANTIATE_TEST_SUITE_P(MemoryAndFile,
-                         MembershipRestart,
-                         ::testing::Values(test::StorageMode::Memory, test::StorageMode::File));
+INSTANTIATE_TEST_SUITE_P(
+    MemoryAndFile,
+    MembershipRestart,
+    ::testing::Values(test::StorageMode::Memory, test::StorageMode::File),
+    [](const ::testing::TestParamInfo<test::StorageMode>& param) {
+      return param.param == test::StorageMode::Memory ? std::string("Memory") : std::string("File");
+    });
 
 }  // namespace
 }  // namespace easyraft
