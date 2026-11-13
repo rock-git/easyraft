@@ -139,6 +139,105 @@ TEST(FileLogStorage, SaveLoadVoteAndMembership) {
   EXPECT_EQ(loaded.value()->voters().front(), 8u);
 }
 
+std::uint32_t test_crc32(const std::uint8_t* data, std::size_t size) {
+  std::uint32_t crc = 0xffffffffu;
+  for (std::size_t i = 0; i < size; ++i) {
+    crc ^= data[i];
+    for (int bit = 0; bit < 8; ++bit) {
+      if ((crc & 1u) != 0u) {
+        crc = (crc >> 1) ^ 0xedb88320u;
+      } else {
+        crc >>= 1;
+      }
+    }
+  }
+  return ~crc;
+}
+
+void append_le_u32(std::string& out, std::uint32_t value) {
+  for (int shift = 0; shift < 32; shift += 8) {
+    out.push_back(static_cast<char>((value >> shift) & 0xffu));
+  }
+}
+
+void append_le_u64(std::string& out, std::uint64_t value) {
+  for (int shift = 0; shift < 64; shift += 8) {
+    out.push_back(static_cast<char>((value >> shift) & 0xffu));
+  }
+}
+
+TEST(FileLogStorage, LegacyUniformMembershipStillLoads) {
+  TempDir dir;
+  // Version 1 layout from before joint configs: magic ERMB, version 1,
+  // count, ids, crc32. Ids are intentionally unsorted.
+  std::string bytes;
+  append_le_u32(bytes, 0x424D5245u);
+  append_le_u32(bytes, 1u);
+  append_le_u32(bytes, 3u);
+  append_le_u64(bytes, 3u);
+  append_le_u64(bytes, 1u);
+  append_le_u64(bytes, 2u);
+  const auto* raw = reinterpret_cast<const std::uint8_t*>(bytes.data());
+  append_le_u32(bytes, test_crc32(raw, bytes.size()));
+  write_bytes(dir.path() / "membership", bytes);
+
+  FileLogStorage storage(dir.path());
+  const auto loaded = storage.load_membership();
+  ASSERT_TRUE(loaded.ok()) << loaded.error();
+  ASSERT_TRUE(loaded.value().has_value());
+  EXPECT_FALSE(loaded.value()->is_joint());
+  EXPECT_EQ(loaded.value()->voters(), (std::vector<NodeId>{1, 2, 3}));
+}
+
+TEST(FileLogStorage, JointMembershipAndMembershipEntriesRoundTrip) {
+  TempDir dir;
+  const std::filesystem::path path = dir.path();
+  const Membership joint = Membership::joint_of({3, 1, 2}, {2, 4, 4});
+  LogEntry membership_entry;
+  membership_entry.id = LogId{2, 1, 1};
+  membership_entry.kind = EntryKind::Membership;
+  membership_entry.data = joint.encode();
+  std::string binary("bin");
+  binary.push_back('\0');
+  binary.append("end");
+
+  {
+    FileLogStorage storage(path);
+    ASSERT_TRUE(storage.save_membership(joint).ok());
+    ASSERT_TRUE(storage
+                    .append({membership_entry, entry(2, 1, 2, EntryKind::Application, binary)})
+                    .ok());
+  }
+
+  FileLogStorage reopened(path);
+  const auto loaded = reopened.load_membership();
+  ASSERT_TRUE(loaded.ok()) << loaded.error();
+  ASSERT_TRUE(loaded.value().has_value());
+  EXPECT_EQ(*loaded.value(), joint);
+  EXPECT_TRUE(loaded.value()->is_joint());
+  EXPECT_EQ(loaded.value()->configs()[0], (std::vector<NodeId>{1, 2, 3}));
+  EXPECT_EQ(loaded.value()->configs()[1], (std::vector<NodeId>{2, 4}));
+
+  const auto log = reopened.read(1, 2);
+  ASSERT_TRUE(log.ok()) << log.error();
+  ASSERT_EQ(log.value().size(), 2u);
+  EXPECT_EQ(log.value()[0].kind, EntryKind::Membership);
+  EXPECT_EQ(log.value()[0].data, joint.encode());
+  const auto decoded = Membership::decode(log.value()[0].data);
+  ASSERT_TRUE(decoded.has_value());
+  EXPECT_EQ(*decoded, joint);
+  EXPECT_EQ(log.value()[1].kind, EntryKind::Application);
+  EXPECT_EQ(log.value()[1].data, binary);
+
+  const Membership uniform{{9, 8}};
+  ASSERT_TRUE(reopened.save_membership(uniform).ok());
+  const auto replaced = reopened.load_membership();
+  ASSERT_TRUE(replaced.ok());
+  ASSERT_TRUE(replaced.value().has_value());
+  EXPECT_FALSE(replaced.value()->is_joint());
+  EXPECT_EQ(replaced.value()->voters(), (std::vector<NodeId>{8, 9}));
+}
+
 TEST(FileLogStorage, AppendAndReadPayloads) {
   TempDir dir;
   FileLogStorage storage(dir.path());

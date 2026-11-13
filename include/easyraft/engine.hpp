@@ -20,6 +20,7 @@ namespace easyraft {
 // The engine has already applied the same change to its in-memory shadow.
 enum class CommandKind {
   SaveVote,
+  SaveMembership,
   Truncate,
   Append,
   Apply,
@@ -28,6 +29,7 @@ enum class CommandKind {
 struct Command {
   CommandKind kind{CommandKind::SaveVote};
   Vote vote{};
+  Membership membership{};
   LogIndex index{0};
   std::vector<LogEntry> entries;
   LogEntry entry{};
@@ -76,6 +78,10 @@ class Engine {
                      LogIndex already_applied = 0);
   StepResult on_tick();
   ProposeResult propose(std::string data);
+  // Appends a joint config of the current voters and `voters`, then the
+  // uniform target once that joint entry commits. `accepted` is false when
+  // this node cannot start a change. The returned index is the joint entry.
+  ProposeResult change_membership(std::vector<NodeId> voters);
 
   VoteStep on_pre_vote(const VoteRequest& request);
   StepResult on_pre_vote_response(NodeId from, const PreVoteResponse& response);
@@ -85,6 +91,9 @@ class Engine {
   StepResult on_append_response(NodeId from, const AppendEntriesResponse& response);
 
   bool initialized() const { return initialized_; }
+  const Membership& membership() const { return membership_; }
+  // Joint config still in effect, or a membership entry not yet committed.
+  bool membership_changing() const;
   Role role() const { return role_; }
   const Vote& vote() const { return vote_; }
   Term term() const { return vote_.leader.term; }
@@ -110,6 +119,8 @@ class Engine {
 
   const LogEntry* find(LogIndex index) const;
   std::optional<LogId> last_log_id() const;
+  bool has_quorum(const std::set<NodeId>& grants) const;
+  std::optional<LogIndex> quorum_match_index() const;
   std::uint64_t sample_timeout();
   bool follower_lease_valid() const;
   bool leader_quorum_lease_valid() const;
@@ -120,6 +131,11 @@ class Engine {
   void append_local(StepResult& out, EntryKind kind, std::string data);
   void truncate_from(StepResult& out, LogIndex index);
   void advance_commit(StepResult& out);
+  void adopt_membership(StepResult& out, Membership next);
+  Membership infer_base(const Membership& stored) const;
+  Membership membership_from_log() const;
+  void sync_progress();
+  void continue_membership(StepResult& out);
   void replicate_all(StepResult& out);
   void send_append(StepResult& out, NodeId to);
   void send_vote_requests(StepResult& out, bool pre_vote, const Vote& vote);
@@ -132,6 +148,10 @@ class Engine {
   Config config_;
   bool initialized_{false};
   Membership membership_{};
+  // Membership in effect when the log has no membership entry. Inferred on
+  // recover from the first joint entry's old config, or from the stored one.
+  Membership base_membership_{};
+  bool continuing_{false};
   Vote vote_{};
   Role role_{Role::Follower};
   bool leading_{false};
