@@ -7,6 +7,7 @@
 #include <cerrno>
 #include <cstdint>
 #include <limits>
+#include <new>
 #include <optional>
 #include <string>
 #include <system_error>
@@ -26,8 +27,8 @@ constexpr std::uint32_t kLogMagic = 0x474C5245u;          // 'ERLG'
 constexpr std::uint32_t kVersion = 1u;
 constexpr std::uint64_t kLogHeaderSize = 8;
 constexpr std::size_t kVoteBytes = 29;
-constexpr std::uint32_t kMaxRecordBody = 32u * 1024u * 1024u;
 constexpr std::uint32_t kEntryPrefix = 29u;
+constexpr std::uint64_t kRecordFraming = 8;
 constexpr std::uint32_t kMaxVoters = 100000u;
 constexpr std::uint64_t kMaxMetaBytes = 1u << 20;
 
@@ -343,7 +344,10 @@ std::optional<Membership> decode_membership(const std::string& bytes) {
 }
 
 std::optional<std::string> encode_record(const LogEntry& entry) {
-  if (entry.data.size() > static_cast<std::size_t>(kMaxRecordBody - kEntryPrefix)) {
+  // body_len is a uint32. Anything larger cannot be framed; this is the same
+  // set of payloads MemoryLogStorage will store, short of that format limit.
+  if (entry.data.size() >
+      static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max() - kEntryPrefix)) {
     return std::nullopt;
   }
   std::uint8_t kind = 0;
@@ -364,11 +368,15 @@ std::optional<std::string> encode_record(const LogEntry& entry) {
   body.append(entry.data);
 
   std::string out;
-  out.reserve(4 + body.size() + 4);
+  out.reserve(static_cast<std::size_t>(kRecordFraming) + body.size() + 4);
   append_u32(out, static_cast<std::uint32_t>(body.size()));
-  const std::uint32_t sum = crc32(body);
+  // Checksum the length by itself so a flipped length is not mistaken for a
+  // torn tail and used to delete every later record.
+  const std::uint32_t length_crc =
+      crc32(reinterpret_cast<const std::uint8_t*>(out.data()), out.size());
+  append_u32(out, length_crc);
   out.append(body);
-  append_u32(out, sum);
+  append_u32(out, crc32(body));
   return out;
 }
 
@@ -506,31 +514,45 @@ bool FileLogStorage::recover_log() {
   bool torn_tail = false;
   while (offset < file_size) {
     const std::uint64_t remaining = file_size - offset;
-    if (remaining < 4) {
+    if (remaining < kRecordFraming) {
+      // Not enough bytes for an authenticated length. The final write stopped
+      // before its framing was complete.
       torn_tail = true;
       break;
     }
     std::uint8_t len_bytes[4];
-    if (!pread_all(log_fd_, len_bytes, sizeof len_bytes, offset)) {
+    std::uint8_t length_crc_bytes[4];
+    if (!pread_all(log_fd_, len_bytes, sizeof len_bytes, offset) ||
+        !pread_all(log_fd_, length_crc_bytes, sizeof length_crc_bytes, offset + 4)) {
       return false;
     }
     std::uint32_t body_len = 0;
-    if (!read_u32(len_bytes, sizeof len_bytes, 0, body_len)) {
+    std::uint32_t length_crc = 0;
+    if (!read_u32(len_bytes, sizeof len_bytes, 0, body_len) ||
+        !read_u32(length_crc_bytes, sizeof length_crc_bytes, 0, length_crc)) {
       return false;
     }
-    const std::uint64_t need = 4ull + static_cast<std::uint64_t>(body_len) + 4ull;
+    if (crc32(len_bytes, sizeof len_bytes) != length_crc) {
+      // The length no longer matches its checksum, so this is not a torn
+      // append. Leave every later record on disk.
+      return false;
+    }
+    const std::uint64_t need = kRecordFraming + static_cast<std::uint64_t>(body_len) + 4ull;
     if (need > remaining) {
-      // The length prefix runs past EOF. That is an incomplete final write.
+      // The length is authentic and the body runs past EOF: an incomplete
+      // final write, with no intact record hidden behind it.
       torn_tail = true;
       break;
     }
-    if (body_len > kMaxRecordBody) {
+    std::vector<std::uint8_t> body;
+    try {
+      body.resize(body_len);
+    } catch (const std::bad_alloc&) {
       return false;
     }
-    std::vector<std::uint8_t> body(body_len);
     std::uint8_t crc_bytes[4];
-    if (!pread_all(log_fd_, body.data(), body.size(), offset + 4) ||
-        !pread_all(log_fd_, crc_bytes, sizeof crc_bytes, offset + 4 + body_len)) {
+    if (!pread_all(log_fd_, body.data(), body.size(), offset + kRecordFraming) ||
+        !pread_all(log_fd_, crc_bytes, sizeof crc_bytes, offset + kRecordFraming + body_len)) {
       return false;
     }
     std::uint32_t stored_crc = 0;
