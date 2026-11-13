@@ -5,27 +5,46 @@
 
 #include "easyraft/easyraft.hpp"
 
+#include <atomic>
 #include <deque>
+#include <filesystem>
 #include <functional>
 #include <map>
 #include <memory>
 #include <set>
 #include <sstream>
 #include <stdexcept>
+#include <system_error>
 #include <utility>
 #include <vector>
 
+#include <unistd.h>
+
 namespace easyraft {
 namespace test {
+
+enum class StorageMode {
+  Memory,
+  File,
+};
 
 // Deterministic in-process network. send() only queues; Cluster::tick() drains
 // in FIFO order after every node has observed the same tick.
 class Cluster {
  public:
-  Cluster(std::vector<NodeId> ids, Config config, bool stagger_timeouts)
-      : ids_(std::move(ids)) {
+  Cluster(std::vector<NodeId> ids,
+          Config config,
+          bool stagger_timeouts,
+          StorageMode storage_mode = StorageMode::Memory)
+      : ids_(std::move(ids)), storage_mode_(storage_mode) {
     if (ids_.empty()) {
       throw std::invalid_argument("cluster needs at least one node");
+    }
+    if (storage_mode_ == StorageMode::File) {
+      static std::atomic<std::uint64_t> seq{0};
+      root_ = std::filesystem::temp_directory_path() /
+              ("easyraft-" + std::to_string(::getpid()) + "-" + std::to_string(seq.fetch_add(1)));
+      std::filesystem::create_directories(root_);
     }
     for (std::size_t i = 0; i < ids_.size(); ++i) {
       const NodeId id = ids_[i];
@@ -36,7 +55,13 @@ class Cluster {
         node_config.election_timeout_max = timeout;
       }
       configs_.emplace(id, node_config);
-      stores_.emplace(id, std::make_shared<MemoryLogStorage>());
+      if (storage_mode_ == StorageMode::File) {
+        const std::filesystem::path dir = root_ / std::to_string(id);
+        data_dirs_.emplace(id, dir);
+        stores_.emplace(id, std::make_shared<FileLogStorage>(dir));
+      } else {
+        stores_.emplace(id, std::make_shared<MemoryLogStorage>());
+      }
       machines_.emplace(id, std::make_shared<MemoryStateMachine>());
       running_.emplace(id, true);
       nodes_.emplace(id, std::make_unique<RaftNode>(id, node_config, stores_.at(id), machines_.at(id), &bus_));
@@ -53,6 +78,15 @@ class Cluster {
       if (!started.ok()) {
         throw std::runtime_error("initialize failed");
       }
+    }
+  }
+
+  ~Cluster() {
+    nodes_.clear();
+    stores_.clear();
+    if (!root_.empty()) {
+      std::error_code ec;
+      std::filesystem::remove_all(root_, ec);
     }
   }
 
@@ -108,6 +142,11 @@ class Cluster {
     bus_.discard(id);
     nodes_.at(id).reset();
     machines_.at(id) = std::make_shared<MemoryStateMachine>();
+    if (storage_mode_ == StorageMode::File) {
+      // Close the previous files, then load the same directory again.
+      stores_.at(id).reset();
+      stores_.at(id) = std::make_shared<FileLogStorage>(data_dirs_.at(id));
+    }
     nodes_.at(id) =
         std::make_unique<RaftNode>(id, configs_.at(id), stores_.at(id), machines_.at(id), &bus_);
     running_.at(id) = true;
@@ -115,7 +154,14 @@ class Cluster {
 
   RaftNode& node(NodeId id) { return *nodes_.at(id); }
   const RaftNode& node(NodeId id) const { return *nodes_.at(id); }
-  MemoryLogStorage& storage(NodeId id) { return *stores_.at(id); }
+  MemoryLogStorage& storage(NodeId id) {
+    auto* memory = dynamic_cast<MemoryLogStorage*>(stores_.at(id).get());
+    if (memory == nullptr) {
+      throw std::logic_error("cluster is not using memory storage");
+    }
+    return *memory;
+  }
+  const std::filesystem::path& data_directory(NodeId id) const { return data_dirs_.at(id); }
   MemoryStateMachine& machine(NodeId id) { return *machines_.at(id); }
 
   std::vector<NodeId> leaders() const {
@@ -242,7 +288,10 @@ class Cluster {
   Bus bus_;
   std::vector<NodeId> ids_;
   std::map<NodeId, Config> configs_;
-  std::map<NodeId, std::shared_ptr<MemoryLogStorage>> stores_;
+  std::filesystem::path root_;
+  StorageMode storage_mode_{StorageMode::Memory};
+  std::map<NodeId, std::filesystem::path> data_dirs_;
+  std::map<NodeId, std::shared_ptr<RaftLogStorage>> stores_;
   std::map<NodeId, std::shared_ptr<MemoryStateMachine>> machines_;
   std::map<NodeId, bool> running_;
   std::map<NodeId, std::unique_ptr<RaftNode>> nodes_;
