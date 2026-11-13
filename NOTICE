@@ -1,0 +1,16 @@
+easyraft
+Copyright 2026 easyraft contributors
+
+This software is licensed under the MIT License or the Apache License,
+Version 2.0, at your option. See LICENSE-MIT and LICENSE-APACHE.
+
+easyraft is an independent C++ implementation of the Raft consensus protocol.
+Its architecture and protocol behavior are inspired by OpenRaft
+(https://github.com/databendlabs/openraft), specifically the 0.10 line
+(the `release-0.10` branch and the published 0.10.0 crate). easyraft is not
+an official OpenRaft port, is not a Databend project, and does not contain
+OpenRaft source code.
+
+OpenRaft is developed by the Databend authors and is itself derived from the
+original async-raft project (notably Anthony Dodd and the async-raft authors).
+OpenRaft is licensed under MIT OR Apache-2.0.

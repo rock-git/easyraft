@@ -1,0 +1,160 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright 2026 easyraft contributors
+
+#include "easyraft/node.hpp"
+
+#include <cstdint>
+#include <stdexcept>
+#include <string>
+#include <type_traits>
+#include <utility>
+#include <variant>
+
+namespace easyraft {
+namespace {
+
+template <typename T>
+T check(Result<T> result) {
+  if (!result.ok()) {
+    throw std::runtime_error(std::string("easyraft storage error: ") + to_string(result.error()));
+  }
+  return std::move(result).value();
+}
+
+void check(Result<void> result) {
+  if (!result.ok()) {
+    throw std::runtime_error(std::string("easyraft storage error: ") + to_string(result.error()));
+  }
+}
+
+}  // namespace
+
+RaftNode::RaftNode(NodeId id,
+                   Config config,
+                   std::shared_ptr<RaftLogStorage> storage,
+                   std::shared_ptr<RaftStateMachine> state_machine,
+                   MessageBus* bus)
+    : id_(id),
+      storage_(std::move(storage)),
+      state_machine_(std::move(state_machine)),
+      bus_(bus),
+      engine_(id, std::move(config)) {
+  restore_if_present();
+}
+
+Result<void> RaftNode::initialize(Membership membership) {
+  if (initialized_) {
+    return Result<void>::failure(Error::AlreadyInitialized);
+  }
+  if (membership.empty() || !membership.contains(id_)) {
+    return Result<void>::failure(Error::InvalidMembership);
+  }
+  check(storage_->save_membership(membership));
+  check(storage_->save_vote(Vote{}));
+  apply(engine_.recover(std::move(membership), Vote{}, {}));
+  initialized_ = true;
+  return Result<void>::success();
+}
+
+Result<LogIndex> RaftNode::write(std::string data) {
+  if (!initialized_) {
+    return Result<LogIndex>::failure(Error::NotInitialized);
+  }
+  if (role() != Role::Leader) {
+    return Result<LogIndex>::failure(Error::NotLeader);
+  }
+  ProposeResult proposed = engine_.propose(std::move(data));
+  if (!proposed.accepted) {
+    return Result<LogIndex>::failure(Error::NotLeader);
+  }
+  apply(proposed.step);
+  return Result<LogIndex>::success(proposed.index);
+}
+
+void RaftNode::tick() {
+  if (!initialized_) {
+    return;
+  }
+  apply(engine_.on_tick());
+}
+
+void RaftNode::on_message(const Envelope& message) {
+  if (!initialized_) {
+    return;
+  }
+  dispatch(message);
+}
+
+void RaftNode::restore_if_present() {
+  auto membership = check(storage_->load_membership());
+  if (!membership) {
+    return;
+  }
+  auto vote = check(storage_->load_vote());
+  Vote restored = vote.value_or(Vote{});
+  auto stored = check(storage_->read(1, UINT64_MAX));
+  apply(engine_.recover(std::move(*membership), restored, std::move(stored)));
+  initialized_ = true;
+}
+
+void RaftNode::apply(const StepResult& step) {
+  for (const Command& command : step.commands) {
+    switch (command.kind) {
+      case CommandKind::SaveVote:
+        check(storage_->save_vote(command.vote));
+        break;
+      case CommandKind::Truncate:
+        check(storage_->truncate_from(command.index));
+        break;
+      case CommandKind::Append:
+        check(storage_->append(command.entries));
+        break;
+      case CommandKind::Apply:
+        check(state_machine_->apply(command.entry));
+        break;
+    }
+  }
+  for (const Outbound& message : step.outbound) {
+    send(message.to, message.payload);
+  }
+}
+
+void RaftNode::send(NodeId to, Payload payload) {
+  if (bus_ == nullptr || to == id_) {
+    return;
+  }
+  Envelope envelope;
+  envelope.from = id_;
+  envelope.to = to;
+  envelope.payload = std::move(payload);
+  bus_->send(envelope);
+}
+
+void RaftNode::dispatch(const Envelope& message) {
+  std::visit(
+      [&](const auto& payload) {
+        using T = std::decay_t<decltype(payload)>;
+        if constexpr (std::is_same_v<T, PreVoteRequest>) {
+          VoteStep step = engine_.on_pre_vote(payload.body);
+          apply(step.step);
+          send(message.from, PreVoteResponse{step.response});
+        } else if constexpr (std::is_same_v<T, PreVoteResponse>) {
+          apply(engine_.on_pre_vote_response(message.from, payload.body));
+        } else if constexpr (std::is_same_v<T, RequestVote>) {
+          VoteStep step = engine_.on_vote(payload.body);
+          apply(step.step);
+          send(message.from, RequestVoteResponse{step.response});
+        } else if constexpr (std::is_same_v<T, RequestVoteResponse>) {
+          apply(engine_.on_vote_response(message.from, payload.body));
+        } else if constexpr (std::is_same_v<T, AppendEntriesRequest>) {
+          AppendStep step = engine_.on_append(payload);
+          apply(step.step);
+          send(message.from, step.response);
+        } else if constexpr (std::is_same_v<T, AppendEntriesResponse>) {
+          apply(engine_.on_append_response(message.from, payload));
+        }
+      },
+      message.payload);
+}
+
+}  // namespace easyraft
