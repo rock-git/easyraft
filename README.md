@@ -1,6 +1,6 @@
 # easyraft
 
-easyraft is a small C++20 implementation of the [Raft](https://raft.github.io/) consensus protocol. Phase 1 is the core algorithm: leader election, log replication, flexible quorums, joint-consensus membership changes, learners, log snapshots, and restart from a persisted vote, membership, log, and snapshot.
+easyraft is a small C++20 implementation of the [Raft](https://raft.github.io/) consensus protocol. Phase 1 is the core algorithm: leader election, log replication, flexible quorums, joint-consensus membership changes, learners, log snapshots, linearizable and lease reads, and restart from a persisted vote, membership, log, and snapshot.
 
 The design follows the OpenRaft 0.10 line (`release-0.10`, published as 0.10.0): a pure, tick-driven engine decides, and a thin runtime performs storage and network I/O. This is an independent implementation inspired by that design. It is not an official OpenRaft port and it does not contain OpenRaft source code. OpenRaft is a Databend project and is derived from the original async-raft work. See `NOTICE`.
 
@@ -16,8 +16,9 @@ Included:
 - Voter-set changes through joint consensus: a joint config is committed, then the uniform target. Each side uses its own quorum definition
 - Learners: non-voting replicators that receive the log and snapshots and do not count toward quorum
 - Snapshots of applied state, crash-safe log compaction, and `InstallSnapshot` catch-up for a lagging voter, a new voter, or a learner
+- Linearizable reads (a ReadIndex round on the leader) and lease reads that reuse the leader's existing lease
 
-Not in this phase: linearizable or lease reads, leader transfer, multi-raft, chaos frameworks, OpenTelemetry, and a standalone server or key-value application.
+Not in this phase: leader transfer, multi-raft, chaos frameworks, OpenTelemetry, and a standalone server or key-value application. Followers do not forward reads.
 
 ## Protocol notes
 
@@ -27,7 +28,7 @@ Votes use OpenRaft's default leader id `(term, node_id)`, totally ordered, plus 
 
 PreVote asks peers whether they would grant `term + 1` and changes nothing locally. A single-node voter set skips the round and campaigns immediately. A follower that still has a leader lease (a recent AppendEntries from the leader it follows) rejects both PreVote and RequestVote, so a partitioned node cannot inflate the term and knock over a healthy leader when it returns.
 
-On winning an election the leader appends a blank entry. Only entries written by the current leader move the commit index; once one of those is on a commit quorum of every config in the effective membership, the prefix before it is committed too. That is how entries from the previous term become committed, and how a restarted leader avoids treating an unreplicated suffix as committed. PreVote and RequestVote count an election quorum. The leader lease counts a commit quorum, the same set that can advance the commit index.
+On winning an election the leader appends a blank entry. Only entries written by the current leader move the commit index; once one of those is on a commit quorum of every config in the effective membership, the prefix before it is committed too. That is how entries from the previous term become committed, and how a restarted leader avoids treating an unreplicated suffix as committed. PreVote and RequestVote count an election quorum. The leader lease counts a commit quorum, the same set that can advance the commit index. Linearizable reads confirm leadership with that same commit quorum. Lease reads are local and are allowed only while that lease is still valid.
 
 `initialize()` stores the first uniform voter set, optionally with learners and a quorum. A node id is a voter or a learner or neither, never both. Id 0 is reserved for both sets. `RaftNode::change_membership` is leader-only. It appends a joint membership (the current voters and the target voters) and, once that entry commits, appends the uniform target. The old config keeps its quorum. The new config uses the quorum passed to `change_membership`, or a majority when that argument is omitted. Learners are kept, except a learner named in the target voter set: that node is promoted and leaves the learner set in the joint entry. The effective membership is the last membership entry still in the log, or the membership recorded in the latest snapshot when the remaining log has none, or the initialized set when there is neither. A membership entry commits only when a commit quorum of each voter config in that effective membership has it, so during the joint phase a quorum of the old set alone or the new set alone is not enough. Learners are not part of that count, and a learner's match index cannot advance the commit index. After the uniform target commits, a leader that is no longer a voter steps down, and a removed node is not part of the quorum. A new voter or learner catches up by replicating the log, or by `InstallSnapshot` once the leader has compacted the prefix. An empty set, voter id 0, a learner id that is already a voter, a quorum that does not intersect or cannot be formed, a change from a follower, and a second change while one is in flight are rejected.
 
@@ -42,6 +43,30 @@ The intersection rule is `election + commit > n`, with both thresholds in `1 .. 
 In a joint config each side keeps its own definition. An election needs the election quorum of every side, and a commit needs the commit quorum of every side. That is enough for the joint election sets to intersect the joint commit sets, including when a majority of the old voters can miss a majority of the new voters. Requiring the old and new voter sets themselves to cross-intersect would reject today's replacements, such as `{1, 2, 3}` to `{3, 4, 5}`.
 
 `RaftNode::change_quorum` changes the definition of the current voters. When every old election quorum intersects every new commit quorum and the reverse, it appends one uniform membership entry, the same shape as a learner change. Otherwise it appends a joint config of the same voters and, once that commits, the uniform target. Shrinking the commit quorum on the same voters usually fails the direct check, because an old election quorum can miss a new commit quorum, so that change goes through the joint config. `change_membership` with a new voter set always uses joint consensus. The old side keeps its current quorum and the new side uses the `Quorum` argument, which defaults to a majority. An unchanged voter set does not append. A non-leader returns `Error::NotLeader`. A change that is already in flight returns `Error::Rejected`.
+
+## Linearizable reads and lease reads
+
+Both reads are leader-only. A follower or a learner returns `Error::NotLeader`. This library does not forward a read to the current leader; the caller does that, if it wants to.
+
+`RaftNode::linearizable_read` starts a ReadIndex round and returns an id. `RaftNode::poll_linearizable_read` returns the read index when the round is finished. `Error::Pending` means the caller should tick and deliver RPCs, then poll again. `Error::NotLeader` means leadership was lost before the read was served, so the index must not be used. `Error::Rejected` means this node never started that id. A successful poll is the commit index recorded for the read. The state machine has applied at least that index. The library does not copy state-machine bytes; the caller reads its own `RaftStateMachine` knowing the applied prefix covers the index.
+
+The leader records that index only after it has committed an entry from its own term. Until then the blank entry appended at election (or a later entry of this term) has to commit. That is the same rule that stops a leader from committing a prefix it does not know is committed. The index is then confirmed with a fresh round of AppendEntries. Acks that were already in flight do not count: each confirmation bumps a heartbeat sequence and the follower echoes it. A commit quorum of every voter config must ack. That is the flexible commit quorum, including a joint config's separate sides, not a hard-coded majority. Learners are not voters, so a learner ack cannot confirm the read. On a single node the leader is the whole commit quorum and the poll can succeed in the same call, once the entry is applied.
+
+The read is not served before `last_applied` reaches the recorded index. `ReadReady` is handed to the runtime only after the Apply commands for that index, and the node publishes the poll result only after those applies have run. A read that has not been published is dropped if the node steps down. A result already returned stays with the caller; it was confirmed while this node was still the leader.
+
+`RaftNode::lease_read` skips the quorum round. It is allowed only while the leader's existing lease is valid: a commit quorum of voters, counting this node and not counting learners, has acknowledged the leader within this node's election timeout. That is the same `leader_quorum_lease_valid` check that refuses a disruptive vote. There is no second lease. The call also requires a committed and applied entry from the current term, so a new leader does not answer from a prefix that omits entries the previous leader committed. The returned index is that applied commit index.
+
+`Error::LeaseExpired` means the lease does not cover the read. The call returns no index and does not fall back to `linearizable_read`; the caller starts that round itself if it still wants the value. `Error::Rejected` means the lease is valid but this term's commit is not applied yet, so retrying the lease read can succeed without a quorum round. `Error::NotLeader` means this node is not the leader. A node can still report `Role::Leader` after the lease expires, until it sees a higher term. Lease reads are refused in that window. After a partition elects a new leader, the old leader's lease is no longer valid and its in-flight linearizable read is not served.
+
+The lease is safe while it is valid because any new election needs an election quorum, and every election quorum intersects every commit quorum. A follower also rejects votes while it still has a recent AppendEntries from the leader it follows. The bound is this node's election timeout, the same one the lease already uses. `heartbeat_interval`, `election_timeout_min`, and `election_timeout_max` are unchanged. Matching timeouts across the cluster keep that bound aligned with the followers.
+
+```cpp
+const auto id = node.linearizable_read();
+// tick and deliver RPCs until poll_linearizable_read(id) is not Pending
+const auto index = node.poll_linearizable_read(*id);
+
+const auto leased = node.lease_read();
+```
 
 A follower accepts AppendEntries only after it accepts the leader's vote. If `prev_log_id` does not match, it truncates at that index and rejects. If the prefix matches, identical entries are kept and only the conflicting tail is deleted before the new suffix is appended. The commit index never advances past the prefix just checked against the leader. A prev id that names the snapshot's last included entry matches that compacted prefix, and truncation never deletes the snapshot.
 
@@ -62,7 +87,7 @@ When a follower's `next_index` is below the leader's first available index, the 
 | Path | Role |
 | --- | --- |
 | `include/easyraft/engine.hpp` | Pure protocol state machine |
-| `include/easyraft/node.hpp` | Runtime: timeouts, heartbeats, client writes, membership changes, RPC dispatch |
+| `include/easyraft/node.hpp` | Runtime: timeouts, heartbeats, client writes, membership changes, reads, RPC dispatch |
 | `include/easyraft/storage.hpp` | `RaftLogStorage` |
 | `include/easyraft/state_machine.hpp` | `RaftStateMachine` |
 | `include/easyraft/network.hpp` | `MessageBus` |
@@ -103,7 +128,7 @@ node.tick();  // repeat until role() == Role::Leader
 auto index = node.write("value");
 ```
 
-On a multi-node cluster, pass a `MessageBus` and deliver envelopes back through `RaftNode::on_message`. `write` returns `Error::NotLeader` when the node cannot accept the proposal. `current_leader()` is the established leader, when this node knows one.
+On a multi-node cluster, pass a `MessageBus` and deliver envelopes back through `RaftNode::on_message`. `write` returns `Error::NotLeader` when the node cannot accept the proposal. `current_leader()` is the established leader, when this node knows one. `linearizable_read` and `lease_read` return `Error::NotLeader` from a follower or a learner. A linearizable read on the leader stays `Error::Pending` until `poll_linearizable_read` returns the read index. The state machine has applied at least that index. `lease_read` returns that index only while the leader lease is valid; otherwise it returns `Error::LeaseExpired` or `Error::Rejected` and does not substitute a quorum read.
 
 ```cpp
 auto changed = node.change_membership({1, 2, 4});
