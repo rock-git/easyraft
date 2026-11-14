@@ -327,6 +327,19 @@ class Membership {
   std::size_t quorum() const { return uniform_threshold(false); }
   // Election threshold of a uniform config. A joint config returns 0.
   std::size_t election_quorum() const { return uniform_threshold(true); }
+  // Threshold of one config. Out of range is 0.
+  std::size_t commit_threshold(std::size_t index) const {
+    if (index >= configs_.size()) {
+      return 0;
+    }
+    return threshold_at(index, false);
+  }
+  std::size_t election_threshold(std::size_t index) const {
+    if (index >= configs_.size()) {
+      return 0;
+    }
+    return threshold_at(index, true);
+  }
 
   // True when `granted` reports a commit quorum of every voter config.
   template <typename Pred>
