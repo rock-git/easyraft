@@ -28,6 +28,9 @@ struct AppendEntriesRequest {
   std::optional<LogId> prev_log_id{};
   std::vector<LogEntry> entries;
   LogIndex leader_commit{0};
+  // Bumped when a leader starts a linearizable-read confirmation. A response
+  // echoes it so an ack that left before that round cannot confirm the read.
+  std::uint64_t heartbeat_seq{0};
 };
 
 struct AppendEntriesResponse {
@@ -37,6 +40,8 @@ struct AppendEntriesResponse {
   // The responder's vote rejected the request. The log was not truncated.
   bool rejected_by_vote{false};
   LogIndex match_index{0};
+  // Copied from the request. Zero when the sender did not set a round.
+  std::uint64_t heartbeat_seq{0};
   // Index the leader was trying to send (prev.index + 1, or 1).
   LogIndex probed_next{1};
   // Next index the leader should try after a conflict.

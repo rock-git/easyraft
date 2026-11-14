@@ -483,6 +483,7 @@ AppendStep Engine::on_append(const AppendEntriesRequest& request) {
   AppendStep step;
   step.response.request_vote = request.vote;
   step.response.responder_vote = vote_;
+  step.response.heartbeat_seq = request.heartbeat_seq;
   step.response.probed_next = request.prev_log_id ? request.prev_log_id->index + 1 : 1;
   step.response.hint_next = step.response.probed_next;
   if (!initialized_) {
@@ -1021,6 +1022,7 @@ void Engine::send_append(StepResult& out, NodeId to) {
   AppendEntriesRequest request;
   request.vote = vote_;
   request.leader_commit = commit_index_;
+  request.heartbeat_seq = heartbeat_seq_;
   const LogIndex next = progress.next_index;
   if (next > 1) {
     if (const LogEntry* prev = find(next - 1)) {
