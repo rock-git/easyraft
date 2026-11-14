@@ -12,7 +12,7 @@ Examples of acceptable subjects:
 - `fix(election): close stale prevote and durability holes`
 - `test(storage): cover file log durability and recovery`
 - `docs(storage): show how to open FileLogStorage`
-- `chore: merge pull request #1 phase 1 raft core`
+- `chore: refresh the pinned GoogleTest version`
 
 `type` is lowercase. Common types: `feat`, `fix`, `test`, `docs`, `build`, `refactor`, `chore`. Use a real module scope when one applies (for example `storage`, `raft`, `election`, `cmake`). Omit the scope only when the change is repo-wide.
 
@@ -21,3 +21,11 @@ The subject is English, imperative, and concise. Do not end the subject with a p
 Keep each commit small. Commit as soon as one small, complete unit of work is done. Do not bundle a whole feature into a single large commit. Each commit should compile and make sense on its own.
 
 Do not rewrite `main` unless the owner explicitly asks to rewrite history.
+
+## Merging
+
+Merge pull requests into `main` with rebase (`merge_method: rebase`). Do not use merge commits or squash.
+
+Rebase keeps the pull request's conventional commits as a linear history on `main`. There is no `chore: merge pull request #N ...` merge commit. A subject such as `chore: merge pull request #1 phase 1 raft core` recorded an older merge commit; do not add another one.
+
+Do not merge without the owner's explicit approval. Do not rewrite `main` unless the owner explicitly asks to rewrite history.
