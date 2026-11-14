@@ -316,9 +316,33 @@ std::optional<std::string> encode_uniform_membership(const std::vector<NodeId>& 
   return out;
 }
 
+bool membership_lists_fit(const Membership& membership) {
+  for (const std::vector<NodeId>& config : membership.configs()) {
+    if (config.size() > kMaxVoters) {
+      return false;
+    }
+  }
+  if (membership.learners().size() > kMaxVoters) {
+    return false;
+  }
+  if (membership.has_uniform_learner_override() &&
+      membership.learners_after_joint().size() > kMaxVoters) {
+    return false;
+  }
+  return true;
+}
+
 std::optional<std::string> encode_membership_v3(const Membership& membership) {
+  // Membership::decode rejects a list longer than 100,000 ids. load_membership
+  // also refuses a file larger than kMaxMetaBytes, and the version-3 framing
+  // is 16 bytes around the payload. Both limits are checked before the file
+  // is replaced, so a saved membership can be opened again.
+  if (!membership_lists_fit(membership)) {
+    return std::nullopt;
+  }
   const std::string payload = membership.encode();
-  if (payload.size() > kMaxMetaBytes) {
+  constexpr std::uint64_t kFraming = 16;
+  if (payload.size() > kMaxMetaBytes - kFraming) {
     return std::nullopt;
   }
   std::string out;

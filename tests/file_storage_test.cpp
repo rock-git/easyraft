@@ -284,6 +284,40 @@ TEST(FileLogStorage, LearnerMembershipAndSnapshotRoundTrip) {
   EXPECT_EQ(image.value()->data, snapshot.data);
 }
 
+std::vector<NodeId> ids_from(NodeId first, std::size_t count) {
+  std::vector<NodeId> ids(count);
+  for (std::size_t i = 0; i < count; ++i) {
+    ids[i] = first + static_cast<NodeId>(i);
+  }
+  return ids;
+}
+
+TEST(FileLogStorage, OversizedLearnerMembershipIsNotWritten) {
+  TempDir dir;
+  const std::filesystem::path path = dir.path();
+  const Membership kept{{1, 2, 3}, {4}};
+  {
+    FileLogStorage storage(path);
+    ASSERT_TRUE(storage.save_membership(kept).ok());
+
+    // One list past the decoder's 100,000-id cap. The payload itself fits in
+    // the membership file limit, so only the per-list check rejects it.
+    const Membership too_many_learners{{1}, ids_from(2, 100001)};
+    EXPECT_FALSE(storage.save_membership(too_many_learners).ok());
+
+    // Each list is within the cap, but the framed file is larger than
+    // load_membership will read.
+    const Membership too_wide{ids_from(1, 100000), ids_from(100001, 100000)};
+    EXPECT_FALSE(storage.save_membership(too_wide).ok());
+  }
+
+  FileLogStorage reopened(path);
+  const auto loaded = reopened.load_membership();
+  ASSERT_TRUE(loaded.ok()) << loaded.error();
+  ASSERT_TRUE(loaded.value().has_value());
+  EXPECT_EQ(*loaded.value(), kept);
+}
+
 TEST(FileLogStorage, AppendAndReadPayloads) {
   TempDir dir;
   FileLogStorage storage(dir.path());
