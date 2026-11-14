@@ -159,12 +159,13 @@ Result<LogIndex> RaftNode::change_quorum(Quorum quorum) {
   if (role() != Role::Leader) {
     return Result<LogIndex>::failure(Error::NotLeader);
   }
-  if (membership().is_joint() || membership().empty() ||
-      !normalize_quorum(membership().voters().size(), quorum)) {
-    return Result<LogIndex>::failure(Error::InvalidMembership);
-  }
+  // An in-flight change is retryable. Report it before rejecting the
+  // definition, including while the current config is still joint.
   if (engine_.membership_changing()) {
     return Result<LogIndex>::failure(Error::Rejected);
+  }
+  if (membership().empty() || !normalize_quorum(membership().voters().size(), quorum)) {
+    return Result<LogIndex>::failure(Error::InvalidMembership);
   }
   return finish_membership(engine_.change_quorum(quorum));
 }
@@ -235,13 +236,13 @@ Result<LogIndex> RaftNode::demote_voter(NodeId voter) {
   if (voter == 0 || !membership().contains(voter) || membership().voters().size() < 2) {
     return Result<LogIndex>::failure(Error::InvalidMembership);
   }
+  if (engine_.membership_changing()) {
+    return Result<LogIndex>::failure(Error::Rejected);
+  }
   const Quorum current = membership().config_quorum(0);
   if (!current.is_default() &&
       !normalize_quorum(membership().voters().size() - 1, current)) {
     return Result<LogIndex>::failure(Error::InvalidMembership);
-  }
-  if (engine_.membership_changing()) {
-    return Result<LogIndex>::failure(Error::Rejected);
   }
   return finish_membership(engine_.demote_voter(voter));
 }
