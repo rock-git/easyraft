@@ -91,6 +91,8 @@ struct SnapshotBuild {
 struct ReadStart {
   StepResult step;
   bool accepted{false};
+  // The leader already has `max_in_flight_reads` linearizable reads outstanding.
+  bool capped{false};
   std::uint64_t id{0};
 };
 
@@ -149,12 +151,19 @@ class Engine {
   // false when this node is not the leader. The read is not served until
   // `last_applied` reaches the recorded index.
   ReadStart begin_linearizable_read();
+  // Drops a read that has not yet been served. A served read is already gone
+  // from the engine; the runtime still has to drop its own copy.
+  bool cancel_linearizable_read(std::uint64_t id);
   bool linearizable_read_pending(std::uint64_t id) const;
-  // Leader only, and only while `leader_quorum_lease_valid` is still true.
-  // Returns the applied commit index. `LeaseExpired` when the existing lease
-  // does not cover the read; the call does not return state and does not
-  // start a quorum round. `Rejected` when the lease is valid but this term
-  // has not yet committed and applied an entry. Followers return `NotLeader`.
+  std::size_t max_in_flight_reads() const { return config_.max_in_flight_reads; }
+  // Leader only. The read lease is the vote-rejection lease narrowed to real
+  // AppendEntries and InstallSnapshot acks. Each ack expires `election_timeout_min`
+  // ticks after the leader sent the request, and sooner when the voter reports
+  // a shorter minimum. Timestamps written at election, before any ack, do not
+  // count. One tick must have the same duration on every node; this engine has
+  // no wall clock and does not correct drift. `LeaseExpired` does not return
+  // state and does not start a quorum round. `Rejected` means the lease is
+  // valid but this term has not yet committed an entry through `last_applied`.
   Result<LogIndex> lease_read() const;
 
   VoteStep on_pre_vote(const VoteRequest& request);
@@ -189,7 +198,15 @@ class Engine {
   struct Progress {
     LogIndex next_index{1};
     LogIndex match_index{0};
+    // Vote-rejection lease. Set when leadership starts, then refreshed when a
+    // reply arrives. Read leases do not use this stamp.
     std::uint64_t last_ack_tick{0};
+    // Set only by a real AppendEntries or InstallSnapshot ack. `read_ack_send_tick`
+    // is the leader tick copied onto that request. `read_ack_timeout` is the
+    // shorter of this node's election_timeout_min and the voter's.
+    bool read_acked{false};
+    std::uint64_t read_ack_send_tick{0};
+    std::uint64_t read_ack_timeout{0};
     std::uint64_t snapshot_offset{0};
     std::string snapshot_id;
   };
@@ -226,6 +243,8 @@ class Engine {
   std::uint64_t sample_timeout();
   bool follower_lease_valid() const;
   bool leader_quorum_lease_valid() const;
+  bool leader_read_lease_valid() const;
+  void note_read_lease(Progress& progress, std::uint64_t sent_tick, std::uint64_t voter_min);
   void note_leader_contact();
   bool update_vote(StepResult& out, const Vote& incoming);
   void become_leader(StepResult& out);
