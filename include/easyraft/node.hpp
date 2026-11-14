@@ -30,8 +30,18 @@ class RaftNode {
   Result<LogIndex> write(std::string data);
   // Only the leader starts a voter-set change. The joint entry is appended
   // locally; the uniform target is appended once the joint entry commits.
-  // Returns the joint entry's index. An unchanged set returns the last index.
+  // Learners stay in the learner set, except a learner listed in `voters`,
+  // who is promoted and leaves that set. Returns the joint entry's index.
+  // An unchanged voter set returns the last index.
   Result<LogIndex> change_membership(std::vector<NodeId> voters);
+  // Only the leader changes the learner set. One uniform membership entry is
+  // appended; joint consensus is not used. Returns that entry's index.
+  Result<LogIndex> add_learner(NodeId learner);
+  Result<LogIndex> remove_learner(NodeId learner);
+  // Only the leader demotes a voter. Joint consensus removes it from the
+  // voter set, and the uniform target adds it as a learner. Returns the
+  // joint entry's index.
+  Result<LogIndex> demote_voter(NodeId voter);
   // Compact through the applied index. Followers may compact locally; only a
   // leader replicates the image. `Rejected` means nothing new has been applied
   // since the current snapshot.
@@ -61,6 +71,7 @@ class RaftNode {
  private:
   void restore_if_present();
   void apply(const StepResult& step);
+  Result<LogIndex> finish_membership(ProposeResult proposed);
   void send(NodeId to, Payload payload);
   void dispatch(const Envelope& message);
 
