@@ -181,6 +181,12 @@ class Cluster {
 
   void drop_append_responses(bool drop) { drop_append_responses_ = drop; }
 
+  // Park AppendEntries responses instead of delivering them. `release` puts
+  // the parked responses at the front of the queue in reverse arrival order,
+  // so the next tick handles them before anything queued afterward.
+  void hold_append_responses(bool hold) { bus_.hold_append_responses(hold); }
+  void release_held_append_responses_reversed() { bus_.release_held_reversed(); }
+
   void stop(NodeId id) { running_.at(id) = false; }
 
   void start(NodeId id) { running_.at(id) = true; }
@@ -283,13 +289,32 @@ class Cluster {
     void send(const Envelope& message) override { queue_.push_back(message); }
 
     void discard(NodeId id) {
+      auto keep = [id](const Envelope& message) {
+        return message.from != id && message.to != id;
+      };
       std::deque<Envelope> kept;
       for (auto& message : queue_) {
-        if (message.from != id && message.to != id) {
+        if (keep(message)) {
           kept.push_back(std::move(message));
         }
       }
       queue_ = std::move(kept);
+      std::deque<Envelope> held_kept;
+      for (auto& message : held_) {
+        if (keep(message)) {
+          held_kept.push_back(std::move(message));
+        }
+      }
+      held_ = std::move(held_kept);
+    }
+
+    void hold_append_responses(bool hold) { hold_append_responses_ = hold; }
+
+    void release_held_reversed() {
+      while (!held_.empty()) {
+        queue_.push_front(std::move(held_.back()));
+        held_.pop_back();
+      }
     }
 
     template <typename Allow>
@@ -304,6 +329,11 @@ class Cluster {
         if (!allow(message)) {
           continue;
         }
+        if (hold_append_responses_ &&
+            std::holds_alternative<AppendEntriesResponse>(message.payload)) {
+          held_.push_back(std::move(message));
+          continue;
+        }
         const auto handler = handlers_.find(message.to);
         if (handler == handlers_.end()) {
           continue;
@@ -314,6 +344,8 @@ class Cluster {
 
    private:
     std::deque<Envelope> queue_;
+    std::deque<Envelope> held_;
+    bool hold_append_responses_{false};
     std::map<NodeId, std::function<void(const Envelope&)>> handlers_;
   };
 
