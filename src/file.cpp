@@ -316,9 +316,52 @@ std::optional<std::string> encode_uniform_membership(const std::vector<NodeId>& 
   return out;
 }
 
+bool membership_lists_fit(const Membership& membership) {
+  for (const std::vector<NodeId>& config : membership.configs()) {
+    if (config.size() > kMaxVoters) {
+      return false;
+    }
+  }
+  if (membership.learners().size() > kMaxVoters) {
+    return false;
+  }
+  if (membership.has_uniform_learner_override() &&
+      membership.learners_after_joint().size() > kMaxVoters) {
+    return false;
+  }
+  return true;
+}
+
+std::optional<std::string> encode_membership_v3(const Membership& membership) {
+  // Membership::decode rejects a list longer than 100,000 ids. load_membership
+  // also refuses a file larger than kMaxMetaBytes, and the version-3 framing
+  // is 16 bytes around the payload. Both limits are checked before the file
+  // is replaced, so a saved membership can be opened again.
+  if (!membership_lists_fit(membership)) {
+    return std::nullopt;
+  }
+  const std::string payload = membership.encode();
+  constexpr std::uint64_t kFraming = 16;
+  if (payload.size() > kMaxMetaBytes - kFraming) {
+    return std::nullopt;
+  }
+  std::string out;
+  out.reserve(16 + payload.size());
+  append_u32(out, kMembershipMagic);
+  append_u32(out, 3u);
+  append_u32(out, static_cast<std::uint32_t>(payload.size()));
+  out.append(payload);
+  append_u32(out, crc32(out));
+  return out;
+}
+
 std::optional<std::string> encode_membership(const Membership& membership) {
-  // Version 1 stays the single sorted voter list so files written before
-  // joint consensus still match what a uniform config writes now.
+  // Learners and a pending demotion use version 3. Version 1 stays the single
+  // sorted voter list so files written before joint consensus still match
+  // what a uniform config writes now.
+  if (!membership.learners().empty() || membership.has_uniform_learner_override()) {
+    return encode_membership_v3(membership);
+  }
   if (!membership.is_joint()) {
     return encode_uniform_membership(membership.voters());
   }
@@ -392,6 +435,20 @@ std::optional<Membership> decode_membership(const std::string& bytes) {
   }
   if (version == kVersion) {
     return decode_uniform_membership(data, bytes.size(), count);
+  }
+  if (version == 3u) {
+    if (count > kMaxMetaBytes) {
+      return std::nullopt;
+    }
+    const std::size_t expect = 12 + static_cast<std::size_t>(count) + 4;
+    if (bytes.size() != expect) {
+      return std::nullopt;
+    }
+    std::uint32_t stored = 0;
+    if (!read_u32(data, bytes.size(), expect - 4, stored) || crc32(data, expect - 4) != stored) {
+      return std::nullopt;
+    }
+    return Membership::decode(std::string_view(bytes.data() + 12, count));
   }
   if (version != 2u || count < 1 || count > 2) {
     return std::nullopt;

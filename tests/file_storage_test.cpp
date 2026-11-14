@@ -238,6 +238,86 @@ TEST(FileLogStorage, JointMembershipAndMembershipEntriesRoundTrip) {
   EXPECT_EQ(replaced.value()->voters(), (std::vector<NodeId>{8, 9}));
 }
 
+TEST(FileLogStorage, LearnerMembershipAndSnapshotRoundTrip) {
+  TempDir dir;
+  const std::filesystem::path path = dir.path();
+  const Membership learners{{1, 2, 3}, {5, 4}};
+  const Membership demotion = Membership::joint_of({1, 2, 3}, {1, 2}, {4}, {3, 4});
+  Snapshot snapshot;
+  snapshot.meta.last_included = LogId{2, 1, 2};
+  snapshot.meta.membership = learners;
+  snapshot.meta.snapshot_id = snapshot_id_from(snapshot.meta.last_included);
+  snapshot.data = std::string("learn\0ers", 9);
+
+  {
+    FileLogStorage storage(path);
+    ASSERT_TRUE(storage.save_membership(learners).ok());
+    ASSERT_TRUE(storage.save_snapshot(snapshot).ok());
+    const auto loaded = storage.load_membership();
+    ASSERT_TRUE(loaded.ok());
+    ASSERT_TRUE(loaded.value().has_value());
+    EXPECT_EQ(*loaded.value(), learners);
+    EXPECT_EQ(loaded.value()->learners(), (std::vector<NodeId>{4, 5}));
+    EXPECT_EQ(loaded.value()->quorum(), 2u);
+    const auto image = storage.load_snapshot();
+    ASSERT_TRUE(image.ok());
+    ASSERT_TRUE(image.value().has_value());
+    EXPECT_EQ(image.value()->meta.membership, learners);
+    EXPECT_EQ(image.value()->meta.membership.learners(), (std::vector<NodeId>{4, 5}));
+
+    ASSERT_TRUE(storage.save_membership(demotion).ok());
+  }
+
+  FileLogStorage reopened(path);
+  const auto loaded = reopened.load_membership();
+  ASSERT_TRUE(loaded.ok()) << loaded.error();
+  ASSERT_TRUE(loaded.value().has_value());
+  EXPECT_EQ(*loaded.value(), demotion);
+  EXPECT_TRUE(loaded.value()->is_joint());
+  EXPECT_EQ(loaded.value()->learners(), (std::vector<NodeId>{4}));
+  EXPECT_TRUE(loaded.value()->has_uniform_learner_override());
+  EXPECT_EQ(loaded.value()->learners_after_joint(), (std::vector<NodeId>{3, 4}));
+  const auto image = reopened.load_snapshot();
+  ASSERT_TRUE(image.ok()) << image.error();
+  ASSERT_TRUE(image.value().has_value());
+  EXPECT_EQ(image.value()->meta.membership.learners(), (std::vector<NodeId>{4, 5}));
+  EXPECT_EQ(image.value()->data, snapshot.data);
+}
+
+std::vector<NodeId> ids_from(NodeId first, std::size_t count) {
+  std::vector<NodeId> ids(count);
+  for (std::size_t i = 0; i < count; ++i) {
+    ids[i] = first + static_cast<NodeId>(i);
+  }
+  return ids;
+}
+
+TEST(FileLogStorage, OversizedLearnerMembershipIsNotWritten) {
+  TempDir dir;
+  const std::filesystem::path path = dir.path();
+  const Membership kept{{1, 2, 3}, {4}};
+  {
+    FileLogStorage storage(path);
+    ASSERT_TRUE(storage.save_membership(kept).ok());
+
+    // One list past the decoder's 100,000-id cap. The payload itself fits in
+    // the membership file limit, so only the per-list check rejects it.
+    const Membership too_many_learners{{1}, ids_from(2, 100001)};
+    EXPECT_FALSE(storage.save_membership(too_many_learners).ok());
+
+    // Each list is within the cap, but the framed file is larger than
+    // load_membership will read.
+    const Membership too_wide{ids_from(1, 100000), ids_from(100001, 100000)};
+    EXPECT_FALSE(storage.save_membership(too_wide).ok());
+  }
+
+  FileLogStorage reopened(path);
+  const auto loaded = reopened.load_membership();
+  ASSERT_TRUE(loaded.ok()) << loaded.error();
+  ASSERT_TRUE(loaded.value().has_value());
+  EXPECT_EQ(*loaded.value(), kept);
+}
+
 TEST(FileLogStorage, AppendAndReadPayloads) {
   TempDir dir;
   FileLogStorage storage(dir.path());

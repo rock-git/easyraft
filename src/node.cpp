@@ -45,13 +45,20 @@ RaftNode::RaftNode(NodeId id,
 namespace {
 
 bool membership_ok(const Membership& membership, NodeId self) {
-  // The first config is uniform. This process may be absent from it so a new
-  // voter can catch up before a membership entry adds it. Id 0 stays reserved.
-  if (self == 0 || membership.empty() || membership.is_joint()) {
+  // The first config is uniform. This process may be absent from it, or be a
+  // learner, so it can catch up before a membership entry adds it as a voter.
+  // Id 0 stays reserved for voters and learners. A node is never both.
+  if (self == 0 || membership.empty() || membership.is_joint() ||
+      membership.learners_overlap_voters()) {
     return false;
   }
   for (NodeId voter : membership.voters()) {
     if (voter == 0) {
+      return false;
+    }
+  }
+  for (NodeId learner : membership.learners()) {
+    if (learner == 0) {
       return false;
     }
   }
@@ -135,7 +142,10 @@ Result<LogIndex> RaftNode::change_membership(std::vector<NodeId> voters) {
   if (engine_.membership_changing()) {
     return Result<LogIndex>::failure(Error::Rejected);
   }
-  ProposeResult proposed = engine_.change_membership(std::move(voters));
+  return finish_membership(engine_.change_membership(std::move(voters)));
+}
+
+Result<LogIndex> RaftNode::finish_membership(ProposeResult proposed) {
   if (!proposed.accepted) {
     return Result<LogIndex>::failure(Error::Rejected);
   }
@@ -148,6 +158,63 @@ Result<LogIndex> RaftNode::change_membership(std::vector<NodeId> voters) {
     return Result<LogIndex>::failure(Error::Storage);
   }
   return Result<LogIndex>::success(proposed.index);
+}
+
+Result<LogIndex> RaftNode::add_learner(NodeId learner) {
+  if (failed_) {
+    return Result<LogIndex>::failure(Error::Storage);
+  }
+  if (!initialized_) {
+    return Result<LogIndex>::failure(Error::NotInitialized);
+  }
+  if (role() != Role::Leader) {
+    return Result<LogIndex>::failure(Error::NotLeader);
+  }
+  if (learner == 0 || membership().contains(learner) || membership().is_learner(learner)) {
+    return Result<LogIndex>::failure(Error::InvalidMembership);
+  }
+  if (engine_.membership_changing()) {
+    return Result<LogIndex>::failure(Error::Rejected);
+  }
+  return finish_membership(engine_.add_learner(learner));
+}
+
+Result<LogIndex> RaftNode::remove_learner(NodeId learner) {
+  if (failed_) {
+    return Result<LogIndex>::failure(Error::Storage);
+  }
+  if (!initialized_) {
+    return Result<LogIndex>::failure(Error::NotInitialized);
+  }
+  if (role() != Role::Leader) {
+    return Result<LogIndex>::failure(Error::NotLeader);
+  }
+  if (!membership().is_learner(learner)) {
+    return Result<LogIndex>::failure(Error::InvalidMembership);
+  }
+  if (engine_.membership_changing()) {
+    return Result<LogIndex>::failure(Error::Rejected);
+  }
+  return finish_membership(engine_.remove_learner(learner));
+}
+
+Result<LogIndex> RaftNode::demote_voter(NodeId voter) {
+  if (failed_) {
+    return Result<LogIndex>::failure(Error::Storage);
+  }
+  if (!initialized_) {
+    return Result<LogIndex>::failure(Error::NotInitialized);
+  }
+  if (role() != Role::Leader) {
+    return Result<LogIndex>::failure(Error::NotLeader);
+  }
+  if (voter == 0 || !membership().contains(voter) || membership().voters().size() < 2) {
+    return Result<LogIndex>::failure(Error::InvalidMembership);
+  }
+  if (engine_.membership_changing()) {
+    return Result<LogIndex>::failure(Error::Rejected);
+  }
+  return finish_membership(engine_.demote_voter(voter));
 }
 
 Result<void> RaftNode::trigger_snapshot() {
