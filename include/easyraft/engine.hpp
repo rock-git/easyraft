@@ -29,6 +29,11 @@ enum class CommandKind {
   SaveSnapshot,
   // Drop log entries at or below `index` once `SaveSnapshot` has succeeded.
   Purge,
+  // A linearizable read may be served at `index`. `read_id` identifies it.
+  // The runtime observes this only after Apply commands for that index.
+  ReadReady,
+  // `read_id` will not become ready. Leadership was lost first.
+  ReadAborted,
 };
 
 struct Command {
@@ -40,6 +45,8 @@ struct Command {
   LogEntry entry{};
   Snapshot snapshot{};
   bool build_snapshot{false};
+  // Set on ReadReady and ReadAborted.
+  std::uint64_t read_id{0};
 };
 
 struct Outbound {
@@ -76,6 +83,14 @@ struct InstallStep {
 struct SnapshotBuild {
   StepResult step;
   bool started{false};
+};
+
+// A linearizable read accepted by the leader. Heartbeats, when a peer quorum
+// is required, are in `step.outbound`. `id` is polled until ReadReady.
+struct ReadStart {
+  StepResult step;
+  bool accepted{false};
+  std::uint64_t id{0};
 };
 
 // Pure Raft state machine. Time advances only through on_tick(); no wall clock.
@@ -126,6 +141,14 @@ class Engine {
   // Joint consensus removes `voter` and the uniform target adds it as a
   // learner. During the joint config it is still a voter.
   ProposeResult demote_voter(NodeId voter);
+  // Leader only. Records the commit index once this term has a committed
+  // entry (the blank entry, if that is still all this leader has committed),
+  // then confirms leadership with AppendEntries acks from a commit quorum of
+  // every voter config. Learners are not part of that quorum. `accepted` is
+  // false when this node is not the leader. The read is not served until
+  // `last_applied` reaches the recorded index.
+  ReadStart begin_linearizable_read();
+  bool linearizable_read_pending(std::uint64_t id) const;
 
   VoteStep on_pre_vote(const VoteRequest& request);
   StepResult on_pre_vote_response(NodeId from, const PreVoteResponse& response);
@@ -175,6 +198,20 @@ class Engine {
     std::uint64_t probe{0};
   };
 
+  // One client linearizable read. `read_index` stays empty until this leader
+  // has committed an entry from its current term. Acks are voters whose
+  // AppendEntries response carried `heartbeat_seq >= confirm_seq`.
+  struct PendingRead {
+    std::uint64_t id{0};
+    std::optional<LogIndex> read_index;
+    bool needs_anchor{false};
+    bool confirming{false};
+    std::uint64_t confirm_seq{0};
+    std::set<NodeId> acks;
+    bool confirmed{false};
+    bool aborted{false};
+  };
+
   const LogEntry* find(LogIndex index) const;
   std::optional<LogId> last_log_id() const;
   bool has_quorum(const std::set<NodeId>& grants) const;
@@ -185,7 +222,14 @@ class Engine {
   void note_leader_contact();
   bool update_vote(StepResult& out, const Vote& incoming);
   void become_leader(StepResult& out);
-  void step_down();
+  void step_down(StepResult& out);
+  bool current_term_committed() const;
+  bool acks_commit_quorum(const std::set<NodeId>& acks) const;
+  void begin_confirmation(StepResult& out, PendingRead& read);
+  void assign_read_anchors();
+  void note_read_ack(StepResult& out, NodeId from, std::uint64_t seq);
+  void serve_reads(StepResult& out);
+  void abort_reads(StepResult& out);
   void append_local(StepResult& out, EntryKind kind, std::string data);
   void truncate_from(StepResult& out, LogIndex index);
   void advance_commit(StepResult& out);
@@ -242,6 +286,8 @@ class Engine {
   std::optional<Campaign> pre_campaign_;
   std::uint64_t next_probe_{0};
   std::map<NodeId, Progress> progress_;
+  std::vector<PendingRead> reads_;
+  std::uint64_t next_read_id_{1};
 };
 
 }  // namespace easyraft

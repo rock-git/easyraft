@@ -153,6 +153,7 @@ StepResult Engine::recover(Membership membership,
   campaign_.reset();
   pre_campaign_.reset();
   progress_.clear();
+  reads_.clear();
   ever_contacted_ = false;
   if (!snapshot_) {
     base_membership_ = infer_base(membership);
@@ -624,6 +625,7 @@ StepResult Engine::on_append_response(NodeId from, const AppendEntriesResponse& 
     progress.last_ack_tick = now_;
     const LogIndex before = commit_index_;
     advance_commit(out);
+    note_read_ack(out, from, response.heartbeat_seq);
     if (commit_index_ > before) {
       replicate_all(out);
     } else if (progress.next_index <= last_index_) {
@@ -826,7 +828,7 @@ bool Engine::update_vote(StepResult& out, const Vote& incoming) {
     return true;
   }
 
-  step_down();
+  step_down(out);
   const bool self_campaign = campaign_ && campaign_->vote == vote_;
   if (self_campaign) {
     role_ = Role::Candidate;
@@ -866,12 +868,152 @@ void Engine::become_leader(StepResult& out) {
   replicate_all(out);
 }
 
-void Engine::step_down() {
+void Engine::step_down(StepResult& out) {
+  abort_reads(out);
   if (leading_) {
     leading_ = false;
     progress_.clear();
   }
   role_ = Role::Follower;
+}
+
+bool Engine::current_term_committed() const {
+  if (!leading_ || commit_index_ == 0) {
+    return false;
+  }
+  if (const LogEntry* entry = find(commit_index_)) {
+    return entry->id.term == vote_.leader.term && entry->id.node == id_;
+  }
+  // The committed prefix was compacted. A snapshot last included by this
+  // leader in this term is enough; an older image is not.
+  if (snapshot_ && snapshot_->meta.last_included.index >= commit_index_) {
+    const LogId& included = snapshot_->meta.last_included;
+    return included.term == vote_.leader.term && included.node == id_;
+  }
+  return false;
+}
+
+bool Engine::acks_commit_quorum(const std::set<NodeId>& acks) const {
+  return membership_.is_commit_quorum([&](NodeId voter) {
+    return voter == id_ || acks.find(voter) != acks.end();
+  });
+}
+
+void Engine::begin_confirmation(StepResult& out, PendingRead& read) {
+  if (read.aborted || read.confirmed) {
+    return;
+  }
+  ++heartbeat_seq_;
+  read.confirm_seq = heartbeat_seq_;
+  read.confirming = true;
+  read.acks.clear();
+  ticks_since_heartbeat_ = 0;
+  // A commit quorum of one is this node alone. No ack round is required.
+  if (!read.needs_anchor && acks_commit_quorum(read.acks)) {
+    read.confirmed = true;
+    return;
+  }
+  replicate_all(out);
+}
+
+void Engine::assign_read_anchors() {
+  if (!leading_ || !current_term_committed()) {
+    return;
+  }
+  for (PendingRead& read : reads_) {
+    if (read.aborted || !read.needs_anchor) {
+      continue;
+    }
+    read.needs_anchor = false;
+    read.read_index = commit_index_;
+    if (!read.confirmed && read.confirming && acks_commit_quorum(read.acks)) {
+      read.confirmed = true;
+    }
+  }
+}
+
+void Engine::note_read_ack(StepResult& out, NodeId from, std::uint64_t seq) {
+  // Learners are not voters, so they cannot confirm a read.
+  if (!leading_ || !membership_.contains(from)) {
+    return;
+  }
+  for (PendingRead& read : reads_) {
+    if (read.aborted || !read.confirming || seq < read.confirm_seq) {
+      continue;
+    }
+    read.acks.insert(from);
+    if (!read.needs_anchor && !read.confirmed && acks_commit_quorum(read.acks)) {
+      read.confirmed = true;
+    }
+  }
+  serve_reads(out);
+}
+
+void Engine::serve_reads(StepResult& out) {
+  if (!leading_ || role_ != Role::Leader) {
+    return;
+  }
+  std::vector<PendingRead> kept;
+  kept.reserve(reads_.size());
+  for (PendingRead& read : reads_) {
+    if (read.aborted) {
+      continue;
+    }
+    const bool servable = read.confirmed && !read.needs_anchor && read.read_index.has_value() &&
+                          last_applied_ >= *read.read_index;
+    if (!servable) {
+      kept.push_back(std::move(read));
+      continue;
+    }
+    Command command;
+    command.kind = CommandKind::ReadReady;
+    command.read_id = read.id;
+    command.index = *read.read_index;
+    out.commands.push_back(std::move(command));
+  }
+  reads_.swap(kept);
+}
+
+void Engine::abort_reads(StepResult& out) {
+  for (const PendingRead& read : reads_) {
+    if (read.aborted) {
+      continue;
+    }
+    Command command;
+    command.kind = CommandKind::ReadAborted;
+    command.read_id = read.id;
+    out.commands.push_back(std::move(command));
+  }
+  reads_.clear();
+}
+
+ReadStart Engine::begin_linearizable_read() {
+  ReadStart started;
+  if (!initialized_ || !leading_ || role_ != Role::Leader) {
+    return started;
+  }
+  PendingRead read;
+  read.id = next_read_id_++;
+  read.needs_anchor = !current_term_committed();
+  if (!read.needs_anchor) {
+    read.read_index = commit_index_;
+  }
+  const std::uint64_t id = read.id;
+  reads_.push_back(std::move(read));
+  begin_confirmation(started.step, reads_.back());
+  serve_reads(started.step);
+  started.accepted = true;
+  started.id = id;
+  return started;
+}
+
+bool Engine::linearizable_read_pending(std::uint64_t id) const {
+  for (const PendingRead& read : reads_) {
+    if (read.id == id && !read.aborted) {
+      return true;
+    }
+  }
+  return false;
 }
 
 void Engine::append_local(StepResult& out, EntryKind kind, std::string data) {
@@ -980,6 +1122,8 @@ void Engine::advance_commit(StepResult& out) {
       enqueue_applies(out);
       continue_membership(out);
       maybe_auto_snapshot(out);
+      assign_read_anchors();
+      serve_reads(out);
       return;
     }
   }
@@ -1097,7 +1241,7 @@ void Engine::elect(StepResult& out) {
   if (leading_ && leader_quorum_lease_valid()) {
     return;
   }
-  step_down();
+  step_down(out);
   Vote candidate_vote;
   candidate_vote.leader.term = vote_.leader.term + 1;
   candidate_vote.leader.node = id_;
@@ -1228,7 +1372,7 @@ void Engine::continue_membership(StepResult& out) {
     }
     if (!decoded->is_joint()) {
       if (!decoded->contains(id_)) {
-        step_down();
+        step_down(out);
         campaign_.reset();
         pre_campaign_.reset();
       }
