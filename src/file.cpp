@@ -356,10 +356,11 @@ std::optional<std::string> encode_membership_v3(const Membership& membership) {
 }
 
 std::optional<std::string> encode_membership(const Membership& membership) {
-  // Learners and a pending demotion use version 3. Version 1 stays the single
-  // sorted voter list so files written before joint consensus still match
-  // what a uniform config writes now.
-  if (!membership.learners().empty() || membership.has_uniform_learner_override()) {
+  // Learners, a pending demotion, and a non-default quorum use version 3.
+  // Version 1 stays the single sorted voter list so files written before
+  // joint consensus still match what a uniform majority config writes now.
+  if (!membership.learners().empty() || membership.has_uniform_learner_override() ||
+      membership.has_custom_quorum()) {
     return encode_membership_v3(membership);
   }
   if (!membership.is_joint()) {
