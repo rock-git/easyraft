@@ -230,6 +230,21 @@ TEST(QuorumCluster, SmallerCommitQuorumDoesNotNeedAMajority) {
   EXPECT_FALSE(cluster.log_contains(5, "learner-only"));
 }
 
+TEST(QuorumCluster, LearnerChangeKeepsTheCustomQuorum) {
+  test::Cluster cluster({1, 2, 3, 4, 5}, test::fast_config(4), true, test::StorageMode::Memory, {},
+                        Quorum{4, 2});
+  ASSERT_TRUE(cluster.until([&] { return cluster.agreed_on(1); }, 50)) << cluster.debug();
+  cluster.add_node(6);
+  ASSERT_TRUE(cluster.node(1).add_learner(6).ok()) << cluster.debug();
+  ASSERT_TRUE(cluster.until(
+      [&] {
+        return cluster.node(1).membership().is_learner(6) && cluster.node(6).membership().is_learner(6) &&
+               uniform_quorum(cluster.node(1), 4, 2) && uniform_quorum(cluster.node(6), 4, 2);
+      },
+      40))
+      << cluster.debug();
+}
+
 TEST(QuorumCluster, SmallerCommitQuorumStillNeedsTheElectionQuorum) {
   test::Cluster cluster({1, 2, 3, 4, 5}, test::fast_config(4), true, test::StorageMode::Memory, {},
                         Quorum{4, 2});
