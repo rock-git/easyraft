@@ -238,6 +238,52 @@ TEST(FileLogStorage, JointMembershipAndMembershipEntriesRoundTrip) {
   EXPECT_EQ(replaced.value()->voters(), (std::vector<NodeId>{8, 9}));
 }
 
+TEST(FileLogStorage, LearnerMembershipAndSnapshotRoundTrip) {
+  TempDir dir;
+  const std::filesystem::path path = dir.path();
+  const Membership learners{{1, 2, 3}, {5, 4}};
+  const Membership demotion = Membership::joint_of({1, 2, 3}, {1, 2}, {4}, {3, 4});
+  Snapshot snapshot;
+  snapshot.meta.last_included = LogId{2, 1, 2};
+  snapshot.meta.membership = learners;
+  snapshot.meta.snapshot_id = snapshot_id_from(snapshot.meta.last_included);
+  snapshot.data = std::string("learn\0ers", 9);
+
+  {
+    FileLogStorage storage(path);
+    ASSERT_TRUE(storage.save_membership(learners).ok());
+    ASSERT_TRUE(storage.save_snapshot(snapshot).ok());
+    const auto loaded = storage.load_membership();
+    ASSERT_TRUE(loaded.ok());
+    ASSERT_TRUE(loaded.value().has_value());
+    EXPECT_EQ(*loaded.value(), learners);
+    EXPECT_EQ(loaded.value()->learners(), (std::vector<NodeId>{4, 5}));
+    EXPECT_EQ(loaded.value()->quorum(), 2u);
+    const auto image = storage.load_snapshot();
+    ASSERT_TRUE(image.ok());
+    ASSERT_TRUE(image.value().has_value());
+    EXPECT_EQ(image.value()->meta.membership, learners);
+    EXPECT_EQ(image.value()->meta.membership.learners(), (std::vector<NodeId>{4, 5}));
+
+    ASSERT_TRUE(storage.save_membership(demotion).ok());
+  }
+
+  FileLogStorage reopened(path);
+  const auto loaded = reopened.load_membership();
+  ASSERT_TRUE(loaded.ok()) << loaded.error();
+  ASSERT_TRUE(loaded.value().has_value());
+  EXPECT_EQ(*loaded.value(), demotion);
+  EXPECT_TRUE(loaded.value()->is_joint());
+  EXPECT_EQ(loaded.value()->learners(), (std::vector<NodeId>{4}));
+  EXPECT_TRUE(loaded.value()->has_uniform_learner_override());
+  EXPECT_EQ(loaded.value()->learners_after_joint(), (std::vector<NodeId>{3, 4}));
+  const auto image = reopened.load_snapshot();
+  ASSERT_TRUE(image.ok()) << image.error();
+  ASSERT_TRUE(image.value().has_value());
+  EXPECT_EQ(image.value()->meta.membership.learners(), (std::vector<NodeId>{4, 5}));
+  EXPECT_EQ(image.value()->data, snapshot.data);
+}
+
 TEST(FileLogStorage, AppendAndReadPayloads) {
   TempDir dir;
   FileLogStorage storage(dir.path());

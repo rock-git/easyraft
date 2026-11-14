@@ -19,7 +19,7 @@ inline constexpr std::uint64_t kMaxSnapshotDataBytes = 64ull << 20;
 
 // Persistent Raft log and hard state.
 //
-// Persists the vote, the membership (one uniform config or a joint pair), the
+// Persists the vote, the membership (voter configs plus learners), the
 // log, and at most one snapshot of applied state. The commit index is not
 // persisted past that snapshot: after a restart the node is a follower and a
 // leader re-commits the suffix. Truncation deletes the suffix starting at
