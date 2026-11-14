@@ -229,6 +229,9 @@ class Engine {
   LogIndex commit_index_{0};
   LogIndex last_applied_{0};
   std::uint64_t now_{0};
+  // Copied onto AppendEntries and echoed by the follower. Read confirmation
+  // bumps it so an older in-flight ack cannot be counted.
+  std::uint64_t heartbeat_seq_{0};
   std::uint64_t election_timeout_ticks_{1};
   std::uint64_t next_election_at_{1};
   std::uint64_t ticks_since_heartbeat_{0};
