@@ -149,7 +149,7 @@ class Cluster {
     if (current.configs().empty()) {
       throw std::logic_error("cluster has no membership");
     }
-    const Membership seed{current.configs().front()};
+    const Membership seed{current.configs().front(), current.learners()};
 
     configs_.emplace(id, node_config);
     if (storage_mode_ == StorageMode::File) {
