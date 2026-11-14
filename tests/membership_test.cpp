@@ -56,6 +56,8 @@ TEST(Membership, EncodeRoundTripsUniformAndJoint) {
   const auto decoded_uniform = Membership::decode(uniform.encode());
   ASSERT_TRUE(decoded_uniform.has_value());
   EXPECT_EQ(*decoded_uniform, uniform);
+  EXPECT_TRUE(uniform.learners().empty());
+  EXPECT_EQ(static_cast<unsigned char>(uniform.encode()[0]), 1u);
 
   const Membership joint = Membership::joint_of({4, 1}, {1, 2, 9});
   const auto decoded_joint = Membership::decode(joint.encode());
@@ -67,6 +69,80 @@ TEST(Membership, EncodeRoundTripsUniformAndJoint) {
   EXPECT_FALSE(Membership::decode(std::string("\x02\x01", 2)).has_value());
   const std::string truncated = uniform.encode().substr(0, 3);
   EXPECT_FALSE(Membership::decode(truncated).has_value());
+}
+
+TEST(Membership, LearnersAreNotPartOfTheQuorum) {
+  const Membership membership{{3, 1, 2, 2}, {5, 4, 4}};
+  EXPECT_EQ(membership.voters(), (std::vector<NodeId>{1, 2, 3}));
+  EXPECT_EQ(membership.learners(), (std::vector<NodeId>{4, 5}));
+  EXPECT_EQ(membership.quorum(), 2u);
+  EXPECT_TRUE(membership.contains(2));
+  EXPECT_FALSE(membership.contains(4));
+  EXPECT_TRUE(membership.is_learner(4));
+  EXPECT_FALSE(membership.is_learner(1));
+  EXPECT_FALSE(membership.learners_overlap_voters());
+  EXPECT_EQ(membership.replication_targets(), (std::vector<NodeId>{1, 2, 3, 4, 5}));
+  EXPECT_FALSE(membership.is_quorum([](NodeId id) { return id == 1 || id == 4 || id == 5; }));
+  EXPECT_TRUE(membership.is_quorum([](NodeId id) { return id == 1 || id == 3; }));
+
+  const Membership overlap{{1, 2}, {2, 3}};
+  EXPECT_TRUE(overlap.learners_overlap_voters());
+  EXPECT_TRUE(overlap.contains(2));
+  EXPECT_TRUE(overlap.is_learner(2));
+}
+
+TEST(Membership, LearnerEncodingRoundTripsAndKeepsVersionOne) {
+  // Version 1, one config, voters 1 and 2. Locked so a learner extension cannot
+  // rewrite the bytes a voter-only config already stores.
+  const std::string version1("\x01\x01\x02\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00"
+                             "\x02\x00\x00\x00\x00\x00\x00\x00",
+                             22);
+  EXPECT_EQ((Membership{{1, 2}}).encode(), version1);
+  const auto legacy = Membership::decode(version1);
+  ASSERT_TRUE(legacy.has_value());
+  EXPECT_EQ(legacy->voters(), (std::vector<NodeId>{1, 2}));
+  EXPECT_TRUE(legacy->learners().empty());
+  EXPECT_FALSE(legacy->has_prior_learners());
+
+  const Membership with_learners{{1, 2, 3}, {6, 4}};
+  EXPECT_EQ(static_cast<unsigned char>(with_learners.encode()[0]), 2u);
+  const auto decoded = Membership::decode(with_learners.encode());
+  ASSERT_TRUE(decoded.has_value());
+  EXPECT_EQ(*decoded, with_learners);
+  EXPECT_FALSE(decoded->has_prior_learners());
+
+  const auto logged = Membership::decode(with_learners.encode_for_log({6}));
+  ASSERT_TRUE(logged.has_value());
+  EXPECT_EQ(*logged, with_learners);
+  EXPECT_TRUE(logged->has_prior_learners());
+  EXPECT_EQ(logged->prior_learners(), (std::vector<NodeId>{6}));
+  const auto stripped = Membership::decode(logged->encode());
+  ASSERT_TRUE(stripped.has_value());
+  EXPECT_EQ(*stripped, with_learners);
+  EXPECT_FALSE(stripped->has_prior_learners());
+
+  const Membership promoted = Membership::joint_of({1, 2, 3}, {1, 2, 3, 4}, {4, 5});
+  EXPECT_TRUE(promoted.is_joint());
+  EXPECT_EQ(promoted.learners(), (std::vector<NodeId>{5}));
+  EXPECT_TRUE(promoted.contains(4));
+  EXPECT_FALSE(promoted.is_learner(4));
+  EXPECT_FALSE(promoted.has_uniform_learner_override());
+  const auto promoted_decoded = Membership::decode(promoted.encode_for_log({4, 5}));
+  ASSERT_TRUE(promoted_decoded.has_value());
+  EXPECT_EQ(*promoted_decoded, promoted);
+  EXPECT_EQ(promoted_decoded->prior_learners(), (std::vector<NodeId>{4, 5}));
+
+  const Membership demoted = Membership::joint_of({1, 2, 3}, {1, 2}, {4}, {3, 4});
+  EXPECT_EQ(demoted.learners(), (std::vector<NodeId>{4}));
+  EXPECT_TRUE(demoted.contains(3));
+  EXPECT_FALSE(demoted.is_learner(3));
+  EXPECT_TRUE(demoted.has_uniform_learner_override());
+  EXPECT_EQ(demoted.learners_after_joint(), (std::vector<NodeId>{3, 4}));
+  const auto demoted_decoded = Membership::decode(demoted.encode());
+  ASSERT_TRUE(demoted_decoded.has_value());
+  EXPECT_EQ(*demoted_decoded, demoted);
+  EXPECT_EQ(demoted_decoded->learners_after_joint(), (std::vector<NodeId>{3, 4}));
+  EXPECT_FALSE(Membership::decode(demoted.encode().substr(0, 4)).has_value());
 }
 
 TEST(Membership, MemoryStorageAcceptsJointMembership) {
