@@ -109,9 +109,16 @@ class Engine {
   // Appends a joint config of the current voters and `voters`, then the
   // uniform target once that joint entry commits. Learners stay learners,
   // except one named in `voters`: that node is promoted and leaves the
-  // learner set. `accepted` is false when this node cannot start a change.
-  // The returned index is the joint entry.
-  ProposeResult change_membership(std::vector<NodeId> voters);
+  // learner set. The old config keeps its quorum. `quorum` is the new
+  // config's definition, and the default is a majority of the new voters.
+  // `accepted` is false when this node cannot start a change. The returned
+  // index is the joint entry. An unchanged voter set does not append.
+  ProposeResult change_membership(std::vector<NodeId> voters, Quorum quorum = {});
+  // Changes the quorum of the current voter set. One uniform entry when every
+  // old election quorum intersects every new commit quorum and the reverse.
+  // Otherwise a joint config of the same voters. `accepted` is false when the
+  // definition does not intersect or this node cannot start a change.
+  ProposeResult change_quorum(Quorum quorum);
   // One uniform membership entry. Learners do not vote, so this does not
   // enter joint consensus. The returned index is that entry.
   ProposeResult add_learner(NodeId learner);
