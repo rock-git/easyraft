@@ -41,6 +41,7 @@ if(BUILD_TESTING)
     tests/membership_test.cpp
     tests/snapshot_test.cpp
     tests/learner_test.cpp
+    tests/quorum_test.cpp
   )
   target_link_libraries(easyraft_tests PRIVATE easyraft GTest::gtest_main)
   target_compile_features(easyraft_tests PRIVATE cxx_std_20)
