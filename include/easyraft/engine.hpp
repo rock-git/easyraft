@@ -24,6 +24,11 @@ enum class CommandKind {
   Truncate,
   Append,
   Apply,
+  // `build_snapshot` asks the runtime to read the state machine. Otherwise
+  // `snapshot.data` is the image to store and install.
+  SaveSnapshot,
+  // Drop log entries at or below `index` once `SaveSnapshot` has succeeded.
+  Purge,
 };
 
 struct Command {
@@ -33,6 +38,8 @@ struct Command {
   LogIndex index{0};
   std::vector<LogEntry> entries;
   LogEntry entry{};
+  Snapshot snapshot{};
+  bool build_snapshot{false};
 };
 
 struct Outbound {
@@ -61,6 +68,16 @@ struct AppendStep {
   AppendEntriesResponse response;
 };
 
+struct InstallStep {
+  StepResult step;
+  InstallSnapshotResponse response;
+};
+
+struct SnapshotBuild {
+  StepResult step;
+  bool started{false};
+};
+
 // Pure Raft state machine. Time advances only through on_tick(); no wall clock.
 //
 // The runtime (RaftNode) executes `commands` against storage and the state
@@ -72,12 +89,23 @@ class Engine {
 
   // `already_applied` is the state machine's cursor. Entries at or below it are
   // not emitted again when a leader re-commits the prefix.
+  // `snapshot`, when present, is applied state. Log entries at or below its
+  // last included index are dropped. `already_applied` is raised to that index
+  // when the state machine cursor is behind the image.
   StepResult recover(Membership membership,
                      Vote vote,
                      std::vector<LogEntry> log,
-                     LogIndex already_applied = 0);
+                     LogIndex already_applied = 0,
+                     std::optional<Snapshot> snapshot = std::nullopt);
   StepResult on_tick();
   ProposeResult propose(std::string data);
+  // Compact through `last_applied`. `started` is false when nothing new has
+  // been applied since the current snapshot. The runtime builds the bytes,
+  // stores them, then calls `store_snapshot_bytes` before the image can be sent.
+  SnapshotBuild begin_snapshot();
+  void store_snapshot_bytes(std::string data);
+  // One replication pass. A leader uses this after a snapshot's bytes are stored.
+  StepResult replicate_now();
   // Appends a joint config of the current voters and `voters`, then the
   // uniform target once that joint entry commits. `accepted` is false when
   // this node cannot start a change. The returned index is the joint entry.
@@ -89,6 +117,8 @@ class Engine {
   StepResult on_vote_response(NodeId from, const VoteResponse& response);
   AppendStep on_append(const AppendEntriesRequest& request);
   StepResult on_append_response(NodeId from, const AppendEntriesResponse& response);
+  InstallStep on_install(const InstallSnapshotRequest& request);
+  StepResult on_install_response(NodeId from, const InstallSnapshotResponse& response);
 
   bool initialized() const { return initialized_; }
   const Membership& membership() const { return membership_; }
@@ -101,6 +131,11 @@ class Engine {
   LogIndex commit_index() const { return commit_index_; }
   LogIndex last_index() const { return last_index_; }
   LogIndex last_applied() const { return last_applied_; }
+  // Zero when no snapshot is stored. Otherwise the last included index.
+  LogIndex compacted_index() const;
+  // First log index that can still be sent or stored. `compacted_index() + 1`.
+  LogIndex first_available_index() const { return compacted_index() + 1; }
+  std::optional<SnapshotMeta> snapshot_meta() const;
   const std::vector<LogEntry>& log() const { return log_; }
   std::string debug() const;
 
@@ -109,6 +144,13 @@ class Engine {
     LogIndex next_index{1};
     LogIndex match_index{0};
     std::uint64_t last_ack_tick{0};
+    std::uint64_t snapshot_offset{0};
+    std::string snapshot_id;
+  };
+
+  struct IncomingSnapshot {
+    SnapshotMeta meta{};
+    std::string data;
   };
 
   struct Campaign {
@@ -136,8 +178,13 @@ class Engine {
   Membership membership_from_log() const;
   void sync_progress();
   void continue_membership(StepResult& out);
+  void maybe_auto_snapshot(StepResult& out);
+  void start_snapshot(StepResult& out);
+  void install_snapshot(StepResult& out, Snapshot snapshot);
+  Membership membership_at(LogIndex index) const;
   void replicate_all(StepResult& out);
   void send_append(StepResult& out, NodeId to);
+  void send_snapshot(StepResult& out, NodeId to);
   void send_vote_requests(StepResult& out, bool pre_vote, const Vote& vote);
   void pre_elect(StepResult& out);
   void elect(StepResult& out);
@@ -156,6 +203,11 @@ class Engine {
   Role role_{Role::Follower};
   bool leading_{false};
   std::vector<LogEntry> log_;
+  std::optional<Snapshot> snapshot_;
+  // False while a local snapshot has been compacted in memory but the runtime
+  // has not yet copied the state-machine bytes in.
+  bool snapshot_data_ready_{false};
+  std::optional<IncomingSnapshot> incoming_;
   LogIndex last_index_{0};
   LogIndex commit_index_{0};
   LogIndex last_applied_{0};

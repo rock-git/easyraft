@@ -41,6 +41,37 @@ struct AppendEntriesResponse {
   LogIndex probed_next{1};
   // Next index the leader should try after a conflict.
   LogIndex hint_next{1};
+  // The probe is inside a compacted prefix. `hint_next` is the first index
+  // still in the log, and the leader must move forward rather than backward.
+  bool compacted{false};
+};
+
+// One chunk of a snapshot. `offset` is the byte offset into `meta`'s image.
+// `done` marks the last chunk. A follower installs only after that chunk.
+struct InstallSnapshotRequest {
+  Vote vote{};
+  SnapshotMeta meta{};
+  std::uint64_t offset{0};
+  std::string data;
+  bool done{false};
+};
+
+struct InstallSnapshotResponse {
+  Vote responder_vote{};
+  Vote request_vote{};
+  bool success{false};
+  // The responder's vote rejected the request. Nothing was installed.
+  bool rejected_by_vote{false};
+  // `meta` is not newer than the responder's snapshot or applied index.
+  bool stale{false};
+  // The follower has accepted every byte of this image.
+  bool installed{false};
+  std::uint64_t received{0};
+  // Responder's last applied index after handling the request.
+  LogIndex follower_index{0};
+  // Snapshot id from the request. A leader ignores progress updates for any
+  // other id, so a delayed chunk cannot move a newer transfer.
+  std::string snapshot_id;
 };
 
 // Distinct wrappers so PreVote cannot be confused with a real RequestVote.
@@ -66,7 +97,9 @@ using Payload = std::variant<PreVoteRequest,
                              RequestVote,
                              RequestVoteResponse,
                              AppendEntriesRequest,
-                             AppendEntriesResponse>;
+                             AppendEntriesResponse,
+                             InstallSnapshotRequest,
+                             InstallSnapshotResponse>;
 
 struct Envelope {
   NodeId from{0};

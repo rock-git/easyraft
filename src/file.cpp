@@ -24,17 +24,26 @@ namespace {
 constexpr std::uint32_t kVoteMagic = 0x54565245u;         // 'ERVT'
 constexpr std::uint32_t kMembershipMagic = 0x424D5245u;   // 'ERMB'
 constexpr std::uint32_t kLogMagic = 0x474C5245u;          // 'ERLG'
+constexpr std::uint32_t kSnapshotMagic = 0x53535245u;    // 'ERSS'
 constexpr std::uint32_t kVersion = 1u;
 constexpr std::uint64_t kLogHeaderSize = 8;
 constexpr std::size_t kVoteBytes = 29;
 constexpr std::uint32_t kEntryPrefix = 29u;
 constexpr std::uint64_t kRecordFraming = 8;
 constexpr std::uint32_t kMaxVoters = 100000u;
+constexpr std::uint32_t kMaxSnapshotId = 1024u;
 constexpr std::uint64_t kMaxMetaBytes = 1u << 20;
+// magic, version, index, term, node, id length, membership length, data length, crc.
+constexpr std::uint64_t kSnapshotOverhead = 52;
+// Every byte encode_snapshot can write must fit through load_snapshot.
+constexpr std::uint64_t kMaxSnapshotFile =
+    kMaxSnapshotDataBytes + kMaxMetaBytes + kMaxSnapshotId + kSnapshotOverhead;
 
 constexpr const char* kVoteName = "vote";
 constexpr const char* kMembershipName = "membership";
 constexpr const char* kLogName = "log";
+constexpr const char* kSnapshotName = "snapshot";
+constexpr const char* kLogRewriteName = "log.rewrite";
 
 Result<void> storage_error() { return Result<void>::failure(Error::Storage); }
 
@@ -424,6 +433,93 @@ std::optional<Membership> decode_membership(const std::string& bytes) {
   return Membership::joint_of(std::move(configs[0]), std::move(configs[1]));
 }
 
+std::optional<std::string> encode_snapshot(const Snapshot& snapshot) {
+  if (snapshot.meta.last_included.index == 0 || snapshot.meta.snapshot_id.empty() ||
+      snapshot.meta.snapshot_id.size() > kMaxSnapshotId ||
+      snapshot.data.size() > kMaxSnapshotDataBytes) {
+    return std::nullopt;
+  }
+  const std::string membership = snapshot.meta.membership.encode();
+  if (membership.size() > kMaxMetaBytes) {
+    return std::nullopt;
+  }
+  std::string out;
+  out.reserve(48 + snapshot.meta.snapshot_id.size() + membership.size() + snapshot.data.size());
+  append_u32(out, kSnapshotMagic);
+  append_u32(out, kVersion);
+  append_u64(out, snapshot.meta.last_included.index);
+  append_u64(out, snapshot.meta.last_included.term);
+  append_u64(out, snapshot.meta.last_included.node);
+  append_u32(out, static_cast<std::uint32_t>(snapshot.meta.snapshot_id.size()));
+  out.append(snapshot.meta.snapshot_id);
+  append_u32(out, static_cast<std::uint32_t>(membership.size()));
+  out.append(membership);
+  append_u64(out, static_cast<std::uint64_t>(snapshot.data.size()));
+  out.append(snapshot.data);
+  append_u32(out, crc32(out));
+  return out;
+}
+
+std::optional<Snapshot> decode_snapshot(const std::string& bytes) {
+  if (bytes.size() < 48) {
+    return std::nullopt;
+  }
+  const auto* data = reinterpret_cast<const std::uint8_t*>(bytes.data());
+  std::uint32_t stored = 0;
+  if (!read_u32(data, bytes.size(), bytes.size() - 4, stored) ||
+      crc32(data, bytes.size() - 4) != stored) {
+    return std::nullopt;
+  }
+  std::uint32_t magic = 0;
+  std::uint32_t version = 0;
+  std::uint64_t index = 0;
+  std::uint64_t term = 0;
+  std::uint64_t node = 0;
+  std::uint32_t id_len = 0;
+  if (!read_u32(data, bytes.size(), 0, magic) || !read_u32(data, bytes.size(), 4, version) ||
+      !read_u64(data, bytes.size(), 8, index) || !read_u64(data, bytes.size(), 16, term) ||
+      !read_u64(data, bytes.size(), 24, node) || !read_u32(data, bytes.size(), 32, id_len)) {
+    return std::nullopt;
+  }
+  if (magic != kSnapshotMagic || version != kVersion || index == 0 || id_len == 0 ||
+      id_len > kMaxSnapshotId) {
+    return std::nullopt;
+  }
+  std::size_t offset = 36;
+  if (bytes.size() - offset < static_cast<std::size_t>(id_len) + 4) {
+    return std::nullopt;
+  }
+  Snapshot snapshot;
+  snapshot.meta.last_included = LogId{term, node, index};
+  snapshot.meta.snapshot_id.assign(bytes.data() + offset, id_len);
+  offset += id_len;
+  std::uint32_t membership_len = 0;
+  if (!read_u32(data, bytes.size(), offset, membership_len) || membership_len > kMaxMetaBytes) {
+    return std::nullopt;
+  }
+  offset += 4;
+  if (bytes.size() - offset < static_cast<std::size_t>(membership_len) + 8) {
+    return std::nullopt;
+  }
+  const auto membership = Membership::decode(
+      std::string_view(bytes.data() + offset, membership_len));
+  if (!membership) {
+    return std::nullopt;
+  }
+  snapshot.meta.membership = *membership;
+  offset += membership_len;
+  std::uint64_t data_len = 0;
+  if (!read_u64(data, bytes.size(), offset, data_len) || data_len > kMaxSnapshotDataBytes) {
+    return std::nullopt;
+  }
+  offset += 8;
+  if (bytes.size() - offset != static_cast<std::size_t>(data_len) + 4) {
+    return std::nullopt;
+  }
+  snapshot.data.assign(bytes.data() + offset, static_cast<std::size_t>(data_len));
+  return snapshot;
+}
+
 std::optional<std::string> encode_record(const LogEntry& entry) {
   // body_len is a uint32. Anything larger cannot be framed; this is the same
   // set of payloads MemoryLogStorage will store, short of that format limit.
@@ -497,7 +593,19 @@ bool decode_entry(const std::uint8_t* body, std::uint32_t body_len, LogEntry& en
 }  // namespace
 
 FileLogStorage::FileLogStorage(std::filesystem::path directory) {
-  if (!open_directory(std::move(directory)) || !open_log() || fsync_retry(dir_fd_) != 0) {
+  if (!open_directory(std::move(directory))) {
+    failed_ = true;
+    return;
+  }
+  // Check the snapshot before torn-tail recovery. A corrupt image must not
+  // truncate the log on the way to reporting the failure.
+  const Result<std::optional<Snapshot>> snapshot = load_snapshot();
+  if (!snapshot.ok()) {
+    failed_ = true;
+    fsync_retry(dir_fd_);
+    return;
+  }
+  if (!open_log() || fsync_retry(dir_fd_) != 0) {
     failed_ = true;
   }
 }
@@ -547,6 +655,8 @@ bool FileLogStorage::open_directory(std::filesystem::path directory) {
   }
   ::unlink((directory_ / "vote.tmp").c_str());
   ::unlink((directory_ / "membership.tmp").c_str());
+  ::unlink((directory_ / "snapshot.tmp").c_str());
+  ::unlink((directory_ / kLogRewriteName).c_str());
   return true;
 }
 
@@ -661,8 +771,11 @@ bool FileLogStorage::recover_log() {
     if (!decode_entry(body.data(), body_len, entry)) {
       return false;
     }
-    const LogIndex expected = static_cast<LogIndex>(entries.size()) + 1;
-    if (entry.id.index != expected) {
+    // A purged log starts at last_included + 1. Records after that stay contiguous.
+    if (entry.id.index == 0) {
+      return false;
+    }
+    if (!entries.empty() && entry.id.index != entries.back().id.index + 1) {
       return false;
     }
     offsets.push_back(offset);
@@ -703,7 +816,8 @@ Result<void> FileLogStorage::write_atomic(const char* name, const std::string& b
   return Result<void>::success();
 }
 
-Result<std::optional<std::string>> FileLogStorage::read_file(const char* name) const {
+Result<std::optional<std::string>> FileLogStorage::read_file(const char* name,
+                                                              std::uint64_t max_bytes) const {
   if (failed_ || dir_fd_ < 0) {
     return Result<std::optional<std::string>>::failure(Error::Storage);
   }
@@ -717,7 +831,7 @@ Result<std::optional<std::string>> FileLogStorage::read_file(const char* name) c
   }
   struct stat st {};
   if (::fstat(fd.get(), &st) != 0 || st.st_size < 0 ||
-      static_cast<std::uint64_t>(st.st_size) > kMaxMetaBytes) {
+      static_cast<std::uint64_t>(st.st_size) > max_bytes) {
     return Result<std::optional<std::string>>::failure(Error::Storage);
   }
   std::string bytes(static_cast<std::size_t>(st.st_size), '\0');
@@ -735,7 +849,7 @@ Result<void> FileLogStorage::save_vote(const Vote& vote) {
 }
 
 Result<std::optional<Vote>> FileLogStorage::load_vote() {
-  auto loaded = read_file(kVoteName);
+  auto loaded = read_file(kVoteName, kMaxMetaBytes);
   if (!loaded.ok()) {
     return Result<std::optional<Vote>>::failure(loaded.error());
   }
@@ -761,7 +875,7 @@ Result<void> FileLogStorage::save_membership(const Membership& membership) {
 }
 
 Result<std::optional<Membership>> FileLogStorage::load_membership() {
-  auto loaded = read_file(kMembershipName);
+  auto loaded = read_file(kMembershipName, kMaxMetaBytes);
   if (!loaded.ok()) {
     return Result<std::optional<Membership>>::failure(loaded.error());
   }
@@ -782,7 +896,7 @@ Result<void> FileLogStorage::append(const std::vector<LogEntry>& entries) {
   if (entries.empty()) {
     return Result<void>::success();
   }
-  const LogIndex base = static_cast<LogIndex>(log_.size()) + 1;
+  const LogIndex base = log_.empty() ? compacted_through_ + 1 : log_.back().id.index + 1;
   if (entries.front().id.index != base) {
     return storage_error();
   }
@@ -835,12 +949,19 @@ Result<void> FileLogStorage::truncate_from(LogIndex index) {
   if (failed_ || log_fd_ < 0 || end_offset_ < kLogHeaderSize) {
     return storage_error();
   }
-  if (index > log_.size()) {
+  // Index 0 drops every log record and leaves the snapshot file alone.
+  if (index != 0 && index <= compacted_through_) {
+    return storage_error();
+  }
+  if (index != 0 && (log_.empty() || index > log_.back().id.index)) {
     return Result<void>::success();
   }
-  const std::size_t keep = index == 0 ? 0 : static_cast<std::size_t>(index - 1);
-  const std::uint64_t new_end =
-      index == 0 ? kLogHeaderSize : offsets_[static_cast<std::size_t>(index - 1)];
+  std::size_t keep = 0;
+  std::uint64_t new_end = kLogHeaderSize;
+  if (index != 0 && !log_.empty() && index > log_.front().id.index) {
+    keep = static_cast<std::size_t>(index - log_.front().id.index);
+    new_end = offsets_[keep];
+  }
   if (new_end < kLogHeaderSize || new_end > end_offset_) {
     return storage_error();
   }
@@ -868,16 +989,156 @@ Result<std::vector<LogEntry>> FileLogStorage::read(LogIndex from, LogIndex to) {
   if (failed_) {
     return Result<std::vector<LogEntry>>::failure(Error::Storage);
   }
-  if (from == 0 || from > to || from > log_.size()) {
+  if (from == 0 || from > to || log_.empty() || from > log_.back().id.index) {
     return Result<std::vector<LogEntry>>::success({});
   }
-  const LogIndex last = std::min(to, static_cast<LogIndex>(log_.size()));
+  const LogIndex first = log_.front().id.index;
+  const LogIndex start = std::max(from, first);
+  const LogIndex last = std::min(to, log_.back().id.index);
+  if (start > last) {
+    return Result<std::vector<LogEntry>>::success({});
+  }
   std::vector<LogEntry> out;
-  out.reserve(static_cast<std::size_t>(last - from + 1));
-  for (LogIndex i = from; i <= last; ++i) {
-    out.push_back(log_[static_cast<std::size_t>(i - 1)]);
+  out.reserve(static_cast<std::size_t>(last - start + 1));
+  for (LogIndex i = start; i <= last; ++i) {
+    out.push_back(log_[static_cast<std::size_t>(i - first)]);
   }
   return Result<std::vector<LogEntry>>::success(std::move(out));
+}
+
+bool FileLogStorage::snapshot_acceptable(const Snapshot& snapshot) const {
+  if (snapshot.meta.last_included.index == 0 || snapshot.meta.snapshot_id.empty()) {
+    return false;
+  }
+  if (snapshot_ && snapshot.meta.last_included.index < snapshot_->meta.last_included.index) {
+    return false;
+  }
+  if (snapshot_ && snapshot.meta.last_included.index == snapshot_->meta.last_included.index &&
+      snapshot.meta.last_included != snapshot_->meta.last_included) {
+    return false;
+  }
+  return true;
+}
+
+Result<void> FileLogStorage::save_snapshot(const Snapshot& snapshot) {
+  if (failed_) {
+    return storage_error();
+  }
+  if (!snapshot_acceptable(snapshot)) {
+    return storage_error();
+  }
+  const std::optional<std::string> encoded = encode_snapshot(snapshot);
+  if (!encoded) {
+    return storage_error();
+  }
+  const Result<void> written = write_atomic(kSnapshotName, *encoded);
+  if (!written.ok()) {
+    return written;
+  }
+  snapshot_ = snapshot;
+  compacted_through_ = snapshot.meta.last_included.index;
+  return Result<void>::success();
+}
+
+Result<std::optional<Snapshot>> FileLogStorage::load_snapshot() {
+  if (failed_ || dir_fd_ < 0) {
+    return Result<std::optional<Snapshot>>::failure(Error::Storage);
+  }
+  auto loaded = read_file(kSnapshotName, kMaxSnapshotFile);
+  if (!loaded.ok()) {
+    return Result<std::optional<Snapshot>>::failure(loaded.error());
+  }
+  if (!loaded.value().has_value()) {
+    if (snapshot_) {
+      return Result<std::optional<Snapshot>>::failure(Error::Storage);
+    }
+    return Result<std::optional<Snapshot>>::success(std::nullopt);
+  }
+  std::optional<Snapshot> decoded = decode_snapshot(*loaded.value());
+  if (!decoded || !snapshot_acceptable(*decoded)) {
+    return Result<std::optional<Snapshot>>::failure(Error::Storage);
+  }
+  snapshot_ = std::move(*decoded);
+  compacted_through_ = std::max(compacted_through_, snapshot_->meta.last_included.index);
+  return Result<std::optional<Snapshot>>::success(snapshot_);
+}
+
+bool FileLogStorage::rewrite_log(const std::vector<LogEntry>& entries) {
+  const auto temporary = directory_ / kLogRewriteName;
+  UniqueFd fd{::open(temporary.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644)};
+  if (!fd) {
+    return false;
+  }
+  std::string image;
+  append_u32(image, kLogMagic);
+  append_u32(image, kVersion);
+  std::vector<std::uint64_t> offsets;
+  offsets.reserve(entries.size());
+  std::uint64_t cursor = kLogHeaderSize;
+  for (const LogEntry& entry : entries) {
+    auto encoded = encode_record(entry);
+    if (!encoded || encoded->size() > std::numeric_limits<std::uint64_t>::max() - cursor) {
+      fd.reset();
+      ::unlink(temporary.c_str());
+      return false;
+    }
+    offsets.push_back(cursor);
+    cursor += encoded->size();
+    image.append(*encoded);
+  }
+  if (!write_all(fd.get(), image.data(), image.size()) || fsync_retry(fd.get()) != 0) {
+    fd.reset();
+    ::unlink(temporary.c_str());
+    return false;
+  }
+  fd.reset();
+  const auto destination = directory_ / kLogName;
+  if (::rename(temporary.c_str(), destination.c_str()) != 0) {
+    ::unlink(temporary.c_str());
+    return false;
+  }
+  if (fsync_retry(dir_fd_) != 0) {
+    // The new name may already be visible. Refuse further use; a restart
+    // loads whichever log the directory entry points at.
+    failed_ = true;
+    return false;
+  }
+  if (log_fd_ >= 0) {
+    ::close(log_fd_);
+    log_fd_ = -1;
+  }
+  log_fd_ = ::open(destination.c_str(), O_RDWR | O_CLOEXEC);
+  if (log_fd_ < 0) {
+    failed_ = true;
+    return false;
+  }
+  log_ = entries;
+  offsets_ = std::move(offsets);
+  end_offset_ = cursor;
+  return true;
+}
+
+Result<void> FileLogStorage::purge_through(LogIndex index) {
+  if (failed_ || log_fd_ < 0 || end_offset_ < kLogHeaderSize) {
+    return storage_error();
+  }
+  if (!snapshot_ || index != snapshot_->meta.last_included.index) {
+    return storage_error();
+  }
+  std::vector<LogEntry> kept;
+  kept.reserve(log_.size());
+  for (const LogEntry& entry : log_) {
+    if (entry.id.index > index) {
+      kept.push_back(entry);
+    }
+  }
+  if (kept.size() != log_.size()) {
+    if (!rewrite_log(kept)) {
+      return storage_error();
+    }
+  }
+  compacted_through_ = index;
+  return Result<void>::success();
 }
 
 }  // namespace easyraft
