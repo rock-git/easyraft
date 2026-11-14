@@ -31,9 +31,17 @@ class RaftNode {
   // Only the leader starts a voter-set change. The joint entry is appended
   // locally; the uniform target is appended once the joint entry commits.
   // Learners stay in the learner set, except a learner listed in `voters`,
-  // who is promoted and leaves that set. Returns the joint entry's index.
-  // An unchanged voter set returns the last index.
-  Result<LogIndex> change_membership(std::vector<NodeId> voters);
+  // who is promoted and leaves that set. The old config keeps its quorum.
+  // `quorum` is the new config's election and commit definition; the default
+  // is a majority of the new voters. Returns the joint entry's index.
+  // An unchanged voter set returns the last index and does not append.
+  Result<LogIndex> change_membership(std::vector<NodeId> voters, Quorum quorum = {});
+  // Only the leader changes the quorum of the current voter set. One uniform
+  // entry is appended when every old election quorum intersects every new
+  // commit quorum and the reverse. Otherwise the change is a joint config of
+  // the same voters. Returns that entry's index. An unchanged definition
+  // returns the last index.
+  Result<LogIndex> change_quorum(Quorum quorum);
   // Only the leader changes the learner set. One uniform membership entry is
   // appended; joint consensus is not used. Returns that entry's index.
   Result<LogIndex> add_learner(NodeId learner);
