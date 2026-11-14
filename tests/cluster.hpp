@@ -35,7 +35,8 @@ class Cluster {
   Cluster(std::vector<NodeId> ids,
           Config config,
           bool stagger_timeouts,
-          StorageMode storage_mode = StorageMode::Memory)
+          StorageMode storage_mode = StorageMode::Memory,
+          std::vector<NodeId> learners = {})
       : ids_(std::move(ids)), storage_mode_(storage_mode) {
     if (ids_.empty()) {
       throw std::invalid_argument("cluster needs at least one node");
@@ -72,7 +73,7 @@ class Cluster {
         nodes_.at(id)->on_message(message);
       });
     }
-    const Membership membership{ids_};
+    const Membership membership{ids_, std::move(learners)};
     for (NodeId id : ids_) {
       const Result<void> started = nodes_.at(id)->initialize(membership);
       if (!started.ok()) {
@@ -180,6 +181,8 @@ class Cluster {
   void drop_append_responses(bool drop) { drop_append_responses_ = drop; }
 
   void stop(NodeId id) { running_.at(id) = false; }
+
+  void start(NodeId id) { running_.at(id) = true; }
 
   void restart(NodeId id) {
     bus_.discard(id);

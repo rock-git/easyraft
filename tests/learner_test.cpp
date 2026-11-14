@@ -410,7 +410,85 @@ TEST(Learner, RejectsIllegalMembershipChanges) {
   EXPECT_FALSE(alone_log.front().is_joint());
 }
 
+enum class UncommittedLearnerChange {
+  Add,
+  Remove,
+  Promote,
+};
+
+void roll_back_uncommitted_learners(test::StorageMode mode, UncommittedLearnerChange change) {
+  // Learner 4 is part of the initial membership, so it is not a log entry.
+  // The uncommitted change is the first membership entry, and only its
+  // recorded prior learner set can restore 4 after a restart and a conflict.
+  test::Cluster cluster({1, 2, 3}, test::fast_config(4), true, mode, {4});
+  ASSERT_TRUE(cluster.until([&] { return cluster.agreed_on(1); }, 30)) << cluster.debug();
+  EXPECT_EQ(cluster.node(1).membership().learners(), (std::vector<NodeId>{4}));
+  EXPECT_EQ(cluster.node(1).membership().voters(), (std::vector<NodeId>{1, 2, 3}));
+  EXPECT_FALSE(cluster.node(1).snapshot_meta().has_value());
+  EXPECT_TRUE(membership_log(cluster.node(1)).empty());
+
+  cluster.isolate(1);
+  if (change == UncommittedLearnerChange::Add) {
+    ASSERT_TRUE(cluster.node(1).add_learner(5).ok()) << cluster.debug();
+    EXPECT_EQ(cluster.node(1).membership().learners(), (std::vector<NodeId>{4, 5}));
+  } else if (change == UncommittedLearnerChange::Remove) {
+    ASSERT_TRUE(cluster.node(1).remove_learner(4).ok()) << cluster.debug();
+    EXPECT_TRUE(cluster.node(1).membership().learners().empty());
+  } else {
+    ASSERT_TRUE(cluster.node(1).change_membership({1, 2, 3, 4}).ok()) << cluster.debug();
+    EXPECT_TRUE(cluster.node(1).membership().is_joint());
+    EXPECT_TRUE(cluster.node(1).membership().learners().empty());
+  }
+  EXPECT_GT(cluster.node(1).last_log_index(), cluster.node(1).commit_index());
+
+  cluster.restart(1);
+  EXPECT_FALSE(cluster.node(1).snapshot_meta().has_value());
+  cluster.stop(1);
+
+  ASSERT_TRUE(cluster.until(
+      [&] {
+        const std::vector<NodeId> leaders = cluster.leaders();
+        return leaders.size() == 1 && leaders.front() != 1;
+      },
+      40))
+      << cluster.debug();
+  const NodeId leader = cluster.leaders().front();
+  ASSERT_TRUE(cluster.node(leader).write("conflict").ok()) << cluster.debug();
+  ASSERT_TRUE(cluster.until(
+      [&] {
+        return cluster.machine(2).data().size() == 1 && cluster.machine(2).data().front() == "conflict" &&
+               cluster.machine(3).data().size() == 1 && cluster.machine(3).data().front() == "conflict";
+      },
+      30))
+      << cluster.debug();
+
+  cluster.heal();
+  cluster.start(1);
+  ASSERT_TRUE(cluster.until(
+      [&] {
+        return cluster.node(1).membership().voters() == std::vector<NodeId>{1, 2, 3} &&
+               cluster.node(1).membership().learners() == std::vector<NodeId>{4} &&
+               !cluster.node(1).membership().is_joint() && cluster.log_contains(1, "conflict");
+      },
+      80))
+      << cluster.debug();
+  EXPECT_FALSE(cluster.node(1).snapshot_meta().has_value());
+  EXPECT_EQ(cluster.node(1).membership().quorum(), 2u);
+}
+
 class LearnerRestart : public ::testing::TestWithParam<test::StorageMode> {};
+
+TEST_P(LearnerRestart, UncommittedAddRollsBackAfterRestart) {
+  roll_back_uncommitted_learners(GetParam(), UncommittedLearnerChange::Add);
+}
+
+TEST_P(LearnerRestart, UncommittedRemovalRollsBackAfterRestart) {
+  roll_back_uncommitted_learners(GetParam(), UncommittedLearnerChange::Remove);
+}
+
+TEST_P(LearnerRestart, UncommittedPromotionRollsBackAfterRestart) {
+  roll_back_uncommitted_learners(GetParam(), UncommittedLearnerChange::Promote);
+}
 
 TEST_P(LearnerRestart, RestoresLearnersAfterCompaction) {
   test::Cluster cluster({1, 2, 3}, test::fast_config(4), true, GetParam());
