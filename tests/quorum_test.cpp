@@ -8,6 +8,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
@@ -63,6 +64,14 @@ TEST(QuorumDefinition, MajorityStaysTheDefaultAndCustomThresholdsRoundTrip) {
   EXPECT_EQ(*logged, custom);
   EXPECT_TRUE(logged->has_prior_quorum());
   EXPECT_TRUE(logged->prior_quorum().is_default());
+
+  // A stored payload must not come back as a live config when its thresholds
+  // do not intersect. The same applies to the quorum recorded for truncation.
+  const Membership disjoint{{1, 2, 3, 4, 5}, {}, Quorum{2, 2}};
+  EXPECT_FALSE(disjoint.quorums_intersect());
+  EXPECT_FALSE(Membership::decode(disjoint.encode()).has_value());
+  EXPECT_FALSE(Membership::decode(custom.encode_for_log({}, Quorum{2, 2})).has_value());
+  EXPECT_FALSE(Membership::decode(custom.encode_for_log({}, Quorum{6, 1})).has_value());
 
   // Each side is a legal threshold quorum. A majority of {1,2,3} can miss a
   // majority of {3,4,5}, and the joint is still legal: an election and a
@@ -182,6 +191,28 @@ TEST(QuorumApi, RejectsIllegalCallsAndAcceptsANoOp) {
   EXPECT_EQ(cluster.node(1).change_membership({1, 2, 3, 4}).error(), Error::Rejected);
 }
 
+TEST(QuorumApi, InFlightJointChangeIsRejectedBeforeTheNextDefinition) {
+  test::Cluster cluster({1, 2, 3, 4, 5}, test::fast_config(4), true);
+  ASSERT_TRUE(cluster.until([&] { return cluster.agreed_on(1); }, 40)) << cluster.debug();
+  cluster.drop_append_responses(true);
+  ASSERT_TRUE(cluster.node(1).change_quorum(Quorum{4, 2}).ok()) << cluster.debug();
+  EXPECT_TRUE(cluster.node(1).membership().is_joint());
+  // {3, 3} is a legal majority. The joint change is still open, so this is
+  // retryable rather than an illegal definition.
+  EXPECT_EQ(cluster.node(1).change_quorum(Quorum{3, 3}).error(), Error::Rejected);
+  EXPECT_EQ(cluster.node(1).change_quorum(Quorum{2, 2}).error(), Error::Rejected);
+}
+
+TEST(QuorumApi, InFlightDemotionIsRejectedBeforeTheQuorumCheck) {
+  test::Cluster cluster({1, 2, 3, 4, 5}, test::fast_config(4), true, test::StorageMode::Memory, {},
+                        Quorum{5, 1});
+  ASSERT_TRUE(cluster.until([&] { return cluster.agreed_on(1); }, 50)) << cluster.debug();
+  cluster.drop_append_responses(true);
+  ASSERT_TRUE(cluster.node(1).change_membership({1, 2, 3, 4}).ok()) << cluster.debug();
+  EXPECT_TRUE(cluster.node(1).membership().is_joint());
+  EXPECT_EQ(cluster.node(1).demote_voter(4).error(), Error::Rejected);
+}
+
 TEST(QuorumCluster, DefaultMajorityStillIgnoresLearners) {
   test::Cluster cluster({1, 2, 3}, test::fast_config(4), true, test::StorageMode::Memory, {4});
   cluster.add_node(4);
@@ -261,6 +292,87 @@ TEST(QuorumCluster, SmallerCommitQuorumStillNeedsTheElectionQuorum) {
   const NodeId leader = cluster.leaders().front();
   EXPECT_NE(leader, 1u);
   EXPECT_TRUE(uniform_quorum(cluster.node(leader), 4, 2));
+}
+
+TEST(QuorumCluster, DisjointElectionQuorumsCannotBothCommit) {
+  // Election needs any 2 of 5, so two pairs can each elect. Commit needs 4,
+  // so those pairs cannot both commit, and a delayed response must not make
+  // the losing entry committed after the logs meet.
+  test::Cluster cluster({1, 2, 3, 4, 5}, test::fast_config(4), true, test::StorageMode::Memory, {},
+                        Quorum{2, 4});
+  cluster.partition({{1, 2}, {3, 4}, {5}});
+  cluster.stop(5);
+  ASSERT_TRUE(cluster.until(
+      [&] {
+        return cluster.node(1).role() == Role::Leader && cluster.node(2).current_leader() == 1 &&
+               cluster.node(3).role() == Role::Leader && cluster.node(4).current_leader() == 3;
+      },
+      30))
+      << cluster.debug();
+
+  const Result<LogIndex> left = cluster.node(1).write("left");
+  const Result<LogIndex> right = cluster.node(3).write("right");
+  ASSERT_TRUE(left.ok()) << left.error();
+  ASSERT_TRUE(right.ok()) << right.error();
+  ASSERT_TRUE(cluster.until(
+      [&] { return cluster.log_contains(2, "left") && cluster.log_contains(4, "right"); }, 20))
+      << cluster.debug();
+  EXPECT_EQ(cluster.node(1).commit_index(), 0u) << cluster.debug();
+  EXPECT_EQ(cluster.node(3).commit_index(), 0u) << cluster.debug();
+  EXPECT_TRUE(cluster.machine(1).data().empty());
+  EXPECT_TRUE(cluster.machine(3).data().empty());
+
+  cluster.hold_append_responses(true);
+  cluster.heal();
+  cluster.tick_n(6);
+  EXPECT_EQ(cluster.node(1).commit_index(), 0u) << cluster.debug();
+  EXPECT_EQ(cluster.node(3).commit_index(), 0u) << cluster.debug();
+  cluster.hold_append_responses(false);
+  cluster.release_held_append_responses_reversed();
+
+  ASSERT_TRUE(cluster.until(
+      [&] {
+        const std::vector<NodeId> leaders = cluster.leaders();
+        if (leaders.size() != 1) {
+          return false;
+        }
+        const NodeId leader = leaders.front();
+        if (cluster.node(leader).commit_index() == 0) {
+          return false;
+        }
+        const std::vector<std::string> committed = cluster.machine(leader).data();
+        for (NodeId id : {1u, 2u, 3u, 4u}) {
+          if (cluster.node(id).commit_index() != cluster.node(leader).commit_index()) {
+            return false;
+          }
+          if (cluster.machine(id).data() != committed) {
+            return false;
+          }
+          if (cluster.log_contains(id, "left") && cluster.log_contains(id, "right")) {
+            return false;
+          }
+        }
+        int survivors = 0;
+        for (const std::string& row : committed) {
+          if (row == "left" || row == "right") {
+            ++survivors;
+          }
+        }
+        return survivors <= 1;
+      },
+      50))
+      << cluster.debug();
+
+  const NodeId leader = cluster.leaders().front();
+  const std::vector<std::string> committed = cluster.machine(leader).data();
+  EXPECT_EQ(std::count(committed.begin(), committed.end(), "left") +
+                std::count(committed.begin(), committed.end(), "right"),
+            1) << cluster.debug();
+  for (NodeId id : {1u, 2u, 3u, 4u}) {
+    EXPECT_EQ(cluster.machine(id).data(), committed) << cluster.debug();
+    EXPECT_FALSE(cluster.log_contains(id, "left") && cluster.log_contains(id, "right"))
+        << cluster.debug();
+  }
 }
 
 TEST(QuorumCluster, SmallerElectionQuorumStillNeedsTheCommitQuorum) {
