@@ -214,7 +214,7 @@ ProposeResult Engine::propose(std::string data) {
   return result;
 }
 
-ProposeResult Engine::change_membership(std::vector<NodeId> voters) {
+ProposeResult Engine::change_membership(std::vector<NodeId> voters, Quorum quorum) {
   ProposeResult result;
   if (!initialized_ || !leading_ || role_ != Role::Leader) {
     return result;
@@ -229,13 +229,57 @@ ProposeResult Engine::change_membership(std::vector<NodeId> voters) {
     result.index = last_index_;
     return result;
   }
+  if (!normalize_quorum(voters.size(), quorum) || !membership_.quorums_intersect()) {
+    return result;
+  }
   const std::vector<NodeId> prior = membership_.learners();
-  const Membership joint =
-      Membership::joint_of(membership_.voters(), std::move(voters), membership_.learners());
+  const Quorum older = membership_.config_quorum(0);
+  const Membership joint = Membership::joint_of(membership_.voters(), std::move(voters), prior, prior,
+                                                older, quorum);
+  if (!joint.quorums_intersect()) {
+    return result;
+  }
   const LogIndex joint_index = last_index_ + 1;
   append_local(result.step, EntryKind::Membership, joint.encode_for_log(prior));
   result.accepted = true;
   result.index = joint_index;
+  replicate_all(result.step);
+  return result;
+}
+
+ProposeResult Engine::change_quorum(Quorum quorum) {
+  ProposeResult result;
+  if (!initialized_ || !leading_ || role_ != Role::Leader || membership_changing()) {
+    return result;
+  }
+  if (membership_.is_joint() || membership_.configs().size() != 1 || membership_.empty()) {
+    return result;
+  }
+  const std::vector<NodeId> voters = membership_.voters();
+  const std::optional<Quorum> next = normalize_quorum(voters.size(), quorum);
+  if (!next) {
+    return result;
+  }
+  const Quorum current = membership_.config_quorum(0);
+  if (*next == current) {
+    result.accepted = true;
+    result.index = last_index_;
+    return result;
+  }
+  const std::vector<NodeId> prior = membership_.learners();
+  const LogIndex index = last_index_ + 1;
+  if (uniform_quorum_change_is_direct(voters, current, *next)) {
+    const Membership uniform{voters, prior, *next};
+    append_local(result.step, EntryKind::Membership, uniform.encode_for_log(prior, current));
+  } else {
+    const Membership joint = Membership::joint_of(voters, voters, prior, prior, current, *next);
+    if (!joint.quorums_intersect()) {
+      return result;
+    }
+    append_local(result.step, EntryKind::Membership, joint.encode_for_log(prior));
+  }
+  result.accepted = true;
+  result.index = index;
   replicate_all(result.step);
   return result;
 }
@@ -252,7 +296,7 @@ ProposeResult Engine::add_learner(NodeId learner) {
   const std::vector<NodeId> prior = membership_.learners();
   std::vector<NodeId> learners = prior;
   learners.push_back(learner);
-  const Membership next{membership_.voters(), std::move(learners)};
+  const Membership next{membership_.voters(), std::move(learners), membership_.config_quorum(0)};
   const LogIndex index = last_index_ + 1;
   append_local(result.step, EntryKind::Membership, next.encode_for_log(prior));
   result.accepted = true;
@@ -277,7 +321,7 @@ ProposeResult Engine::remove_learner(NodeId learner) {
       learners.push_back(id);
     }
   }
-  const Membership next{membership_.voters(), std::move(learners)};
+  const Membership next{membership_.voters(), std::move(learners), membership_.config_quorum(0)};
   const LogIndex index = last_index_ + 1;
   append_local(result.step, EntryKind::Membership, next.encode_for_log(prior));
   result.accepted = true;
@@ -305,8 +349,12 @@ ProposeResult Engine::demote_voter(NodeId voter) {
   const std::vector<NodeId> prior = membership_.learners();
   std::vector<NodeId> after = prior;
   after.push_back(voter);
-  const Membership joint =
-      Membership::joint_of(membership_.voters(), std::move(voters), prior, std::move(after));
+  const Quorum older = membership_.config_quorum(0);
+  if (!older.is_default() && !normalize_quorum(voters.size(), older)) {
+    return result;
+  }
+  const Membership joint = Membership::joint_of(membership_.voters(), std::move(voters), prior,
+                                                std::move(after), older, older);
   const LogIndex index = last_index_ + 1;
   append_local(result.step, EntryKind::Membership, joint.encode_for_log(prior));
   result.accepted = true;
@@ -662,7 +710,7 @@ std::string Engine::debug() const {
       }
       out << configs[c][i];
     }
-    out << "]";
+    out << "] " << membership_.election_threshold(c) << "/" << membership_.commit_threshold(c);
   }
   out << " learners=[";
   const std::vector<NodeId>& learners = membership_.learners();
@@ -735,7 +783,7 @@ bool Engine::leader_quorum_lease_valid() const {
   if (!leading_) {
     return false;
   }
-  return membership_.is_quorum([&](NodeId voter) {
+  return membership_.is_commit_quorum([&](NodeId voter) {
     if (voter == id_) {
       return true;
     }
@@ -805,7 +853,7 @@ void Engine::become_leader(StepResult& out) {
   ticks_since_heartbeat_ = 0;
   // The blank entry is this term's commit anchor. Entries from earlier
   // leaders commit only once this entry (or a later one of ours) is on a
-  // majority. That is the Raft rule OpenRaft keeps.
+  // commit quorum. That is the Raft rule OpenRaft keeps.
   append_local(out, EntryKind::Blank, {});
   for (NodeId peer : peers()) {
     Progress progress;
@@ -873,7 +921,7 @@ void Engine::truncate_from(StepResult& out, LogIndex index) {
 }
 
 bool Engine::has_quorum(const std::set<NodeId>& grants) const {
-  return membership_.is_quorum([&](NodeId id) { return grants.find(id) != grants.end(); });
+  return membership_.is_election_quorum([&](NodeId id) { return grants.find(id) != grants.end(); });
 }
 
 std::optional<LogIndex> Engine::quorum_match_index() const {
@@ -881,7 +929,9 @@ std::optional<LogIndex> Engine::quorum_match_index() const {
     return std::nullopt;
   }
   std::optional<LogIndex> agreed;
-  for (const std::vector<NodeId>& config : membership_.configs()) {
+  const std::vector<std::vector<NodeId>>& configs = membership_.configs();
+  for (std::size_t index = 0; index < configs.size(); ++index) {
+    const std::vector<NodeId>& config = configs[index];
     if (config.empty()) {
       return std::nullopt;
     }
@@ -896,13 +946,13 @@ std::optional<LogIndex> Engine::quorum_match_index() const {
       }
     }
     std::sort(matched.begin(), matched.end());
-    const std::size_t need = config.size() / 2 + 1;
+    const std::size_t need = membership_.commit_threshold(index);
     if (need == 0 || need > matched.size()) {
       return std::nullopt;
     }
-    const LogIndex majority = matched[matched.size() - need];
-    if (!agreed || majority < *agreed) {
-      agreed = majority;
+    const LogIndex committed = matched[matched.size() - need];
+    if (!agreed || committed < *agreed) {
+      agreed = committed;
     }
   }
   return agreed;
@@ -912,17 +962,17 @@ void Engine::advance_commit(StepResult& out) {
   if (!leading_ || membership_.empty()) {
     return;
   }
-  // The highest index stored on a majority of every voter config. Self is
+  // The highest index stored on a commit quorum of every voter config. Self is
   // fully caught up. Learners are not in those configs, so their match index
   // cannot move commit. One pass over the voters, not the uncommitted suffix.
   const std::optional<LogIndex> agreed = quorum_match_index();
   if (!agreed || *agreed <= commit_index_) {
     return;
   }
-  const LogIndex majority_index = *agreed;
+  const LogIndex quorum_index = *agreed;
   // Only an entry from this leader may advance commit. Every index at or
-  // below majority_index is on a majority, so walk back to the newest such entry.
-  for (LogIndex index = majority_index; index > commit_index_; --index) {
+  // below quorum_index is on a commit quorum, so walk back to the newest such entry.
+  for (LogIndex index = quorum_index; index > commit_index_; --index) {
     const LogEntry* entry = find(index);
     if (entry != nullptr && entry->id.term == vote_.leader.term && entry->id.node == id_) {
       commit_index_ = index;
@@ -1092,10 +1142,14 @@ Membership Engine::infer_base(const Membership& stored) const {
     if (decoded->is_joint() && decoded->configs().size() == 2) {
       const std::vector<NodeId>& base_learners =
           decoded->has_prior_learners() ? decoded->prior_learners() : decoded->learners();
-      return Membership{decoded->configs().front(), base_learners};
+      return Membership{decoded->configs().front(), base_learners, decoded->config_quorum(0)};
     }
-    if (decoded->has_prior_learners()) {
-      return Membership{decoded->voters(), decoded->prior_learners()};
+    if (decoded->has_prior_learners() || decoded->has_prior_quorum()) {
+      const std::vector<NodeId>& base_learners =
+          decoded->has_prior_learners() ? decoded->prior_learners() : decoded->learners();
+      const Quorum base_quorum =
+          decoded->has_prior_quorum() ? decoded->prior_quorum() : decoded->config_quorum(0);
+      return Membership{decoded->voters(), base_learners, base_quorum};
     }
     return stored;
   }
@@ -1185,9 +1239,11 @@ void Engine::continue_membership(StepResult& out) {
   }
   // The uniform target becomes effective when it is appended. It commits
   // under that new config, which no longer requires the old voters. Learners
-  // carry forward, including a voter demoted into the learner set.
+  // carry forward, including a voter demoted into the learner set. The new
+  // config keeps the quorum stored on that side of the joint entry.
   const std::vector<NodeId> prior = joint->learners();
-  const Membership uniform{joint->configs()[1], joint->learners_after_joint()};
+  const Membership uniform{joint->configs()[1], joint->learners_after_joint(),
+                           joint->config_quorum(1)};
   append_local(out, EntryKind::Membership, uniform.encode_for_log(prior));
 }
 

@@ -27,16 +27,18 @@ namespace easyraft {
 // missing metadata file loads as nullopt. A leftover `snapshot.tmp` or
 // `log.rewrite` from a crash is deleted on open and never installed.
 //
-// A uniform membership with no learners is still the version-1 record: magic,
-// version 1, voter count, voter ids, crc32. A joint membership with no
-// learners is version 2: magic, version 2, config count (2), then each
-// config's count and ids, then crc32. A membership that records learners, or
-// a joint demotion's follow-up learner set, is version 3: magic, version 3,
-// the byte length of `Membership::encode`, those bytes, and crc32. Version 1
-// and 2 files load as an empty learner set. The snapshot file does not change
-// those versions. It stores its own record: magic "ERSS", version 1, the last
-// included log id, a snapshot id, `Membership::encode` bytes, the opaque
-// state-machine image, and a crc32.
+// A uniform membership with no learners and a majority quorum is still the
+// version-1 record: magic, version 1, voter count, voter ids, crc32. A joint
+// membership with no learners and majority quorums is version 2: magic,
+// version 2, config count (2), then each config's count and ids, then crc32.
+// A membership that records learners, a joint demotion's follow-up learner
+// set, or a non-default quorum is version 3: magic, version 3, the byte
+// length of `Membership::encode`, those bytes, and crc32. Version 1 and 2
+// files load as an empty learner set and majority quorums. The snapshot file
+// does not change those versions. It stores its own record: magic "ERSS",
+// version 1, the last included log id, a snapshot id, `Membership::encode`
+// bytes, the opaque state-machine image, and a crc32. A non-default quorum
+// is inside that membership payload, not a new snapshot version.
 //
 // `log` starts with magic "ERLG" and version 1. Each record is little-endian
 // `uint32 body_len`, `uint32 crc32` of those length bytes, a body, and

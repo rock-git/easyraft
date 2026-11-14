@@ -3,6 +3,7 @@
 
 #include "easyraft/node.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <stdexcept>
 #include <string>
@@ -49,7 +50,7 @@ bool membership_ok(const Membership& membership, NodeId self) {
   // learner, so it can catch up before a membership entry adds it as a voter.
   // Id 0 stays reserved for voters and learners. A node is never both.
   if (self == 0 || membership.empty() || membership.is_joint() ||
-      membership.learners_overlap_voters()) {
+      membership.learners_overlap_voters() || !membership.quorums_intersect()) {
     return false;
   }
   for (NodeId voter : membership.voters()) {
@@ -126,7 +127,7 @@ Result<LogIndex> RaftNode::write(std::string data) {
   return Result<LogIndex>::success(proposed.index);
 }
 
-Result<LogIndex> RaftNode::change_membership(std::vector<NodeId> voters) {
+Result<LogIndex> RaftNode::change_membership(std::vector<NodeId> voters, Quorum quorum) {
   if (failed_) {
     return Result<LogIndex>::failure(Error::Storage);
   }
@@ -136,13 +137,37 @@ Result<LogIndex> RaftNode::change_membership(std::vector<NodeId> voters) {
   if (role() != Role::Leader) {
     return Result<LogIndex>::failure(Error::NotLeader);
   }
-  if (!voter_ids_ok(voters)) {
+  std::vector<NodeId> unique = voters;
+  std::sort(unique.begin(), unique.end());
+  unique.erase(std::unique(unique.begin(), unique.end()), unique.end());
+  if (!voter_ids_ok(unique) || !normalize_quorum(unique.size(), quorum)) {
     return Result<LogIndex>::failure(Error::InvalidMembership);
   }
   if (engine_.membership_changing()) {
     return Result<LogIndex>::failure(Error::Rejected);
   }
-  return finish_membership(engine_.change_membership(std::move(voters)));
+  return finish_membership(engine_.change_membership(std::move(voters), quorum));
+}
+
+Result<LogIndex> RaftNode::change_quorum(Quorum quorum) {
+  if (failed_) {
+    return Result<LogIndex>::failure(Error::Storage);
+  }
+  if (!initialized_) {
+    return Result<LogIndex>::failure(Error::NotInitialized);
+  }
+  if (role() != Role::Leader) {
+    return Result<LogIndex>::failure(Error::NotLeader);
+  }
+  // An in-flight change is retryable. Report it before rejecting the
+  // definition, including while the current config is still joint.
+  if (engine_.membership_changing()) {
+    return Result<LogIndex>::failure(Error::Rejected);
+  }
+  if (membership().empty() || !normalize_quorum(membership().voters().size(), quorum)) {
+    return Result<LogIndex>::failure(Error::InvalidMembership);
+  }
+  return finish_membership(engine_.change_quorum(quorum));
 }
 
 Result<LogIndex> RaftNode::finish_membership(ProposeResult proposed) {
@@ -213,6 +238,11 @@ Result<LogIndex> RaftNode::demote_voter(NodeId voter) {
   }
   if (engine_.membership_changing()) {
     return Result<LogIndex>::failure(Error::Rejected);
+  }
+  const Quorum current = membership().config_quorum(0);
+  if (!current.is_default() &&
+      !normalize_quorum(membership().voters().size() - 1, current)) {
+    return Result<LogIndex>::failure(Error::InvalidMembership);
   }
   return finish_membership(engine_.demote_voter(voter));
 }
