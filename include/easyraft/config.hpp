@@ -25,6 +25,10 @@ struct Config {
   // Largest snapshot payload in one InstallSnapshot request. Zero sends the
   // whole image in a single request.
   std::size_t max_snapshot_chunk{0};
+  // Linearizable reads kept until the caller polls a terminal result or
+  // cancels them. Ready, pending, and aborted ids all count. Zero is raised
+  // to one so the set cannot grow without a bound.
+  std::size_t max_in_flight_reads{1024};
 
   Config normalized() const {
     Config copy = *this;
@@ -39,6 +43,9 @@ struct Config {
     }
     if (copy.max_append_entries == 0) {
       copy.max_append_entries = 1;
+    }
+    if (copy.max_in_flight_reads == 0) {
+      copy.max_in_flight_reads = 1;
     }
     return copy;
   }

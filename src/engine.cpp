@@ -153,6 +153,7 @@ StepResult Engine::recover(Membership membership,
   campaign_.reset();
   pre_campaign_.reset();
   progress_.clear();
+  reads_.clear();
   ever_contacted_ = false;
   if (!snapshot_) {
     base_membership_ = infer_base(membership);
@@ -483,6 +484,9 @@ AppendStep Engine::on_append(const AppendEntriesRequest& request) {
   AppendStep step;
   step.response.request_vote = request.vote;
   step.response.responder_vote = vote_;
+  step.response.heartbeat_seq = request.heartbeat_seq;
+  step.response.sent_tick = request.sent_tick;
+  step.response.voter_timeout_min = static_cast<std::uint64_t>(config_.election_timeout_min);
   step.response.probed_next = request.prev_log_id ? request.prev_log_id->index + 1 : 1;
   step.response.hint_next = step.response.probed_next;
   if (!initialized_) {
@@ -621,8 +625,10 @@ StepResult Engine::on_append_response(NodeId from, const AppendEntriesResponse& 
       progress.next_index = response.match_index + 1;
     }
     progress.last_ack_tick = now_;
+    note_read_lease(progress, response.sent_tick, response.voter_timeout_min);
     const LogIndex before = commit_index_;
     advance_commit(out);
+    note_read_ack(out, from, response.heartbeat_seq);
     if (commit_index_ > before) {
       replicate_all(out);
     } else if (progress.next_index <= last_index_) {
@@ -793,6 +799,44 @@ bool Engine::leader_quorum_lease_valid() const {
   });
 }
 
+bool Engine::leader_read_lease_valid() const {
+  if (!leading_) {
+    return false;
+  }
+  // A peer counts only after a real ack, and only until the shorter of the
+  // two minimum election timeouts has elapsed since this leader sent the
+  // request. Arrival time and the optimistic stamp from becoming leader do
+  // not extend the interval.
+  return membership_.is_commit_quorum([&](NodeId voter) {
+    if (voter == id_) {
+      return true;
+    }
+    const auto found = progress_.find(voter);
+    if (found == progress_.end() || !found->second.read_acked) {
+      return false;
+    }
+    const Progress& progress = found->second;
+    if (progress.read_ack_timeout == 0 || progress.read_ack_send_tick > now_) {
+      return false;
+    }
+    return now_ - progress.read_ack_send_tick < progress.read_ack_timeout;
+  });
+}
+
+void Engine::note_read_lease(Progress& progress, std::uint64_t sent_tick, std::uint64_t voter_min) {
+  if (voter_min == 0 || sent_tick > now_) {
+    return;
+  }
+  // A delayed reply for an older request must not replace a newer ack.
+  if (progress.read_acked && sent_tick < progress.read_ack_send_tick) {
+    return;
+  }
+  const auto local_min = static_cast<std::uint64_t>(config_.election_timeout_min);
+  progress.read_acked = true;
+  progress.read_ack_send_tick = sent_tick;
+  progress.read_ack_timeout = voter_min < local_min ? voter_min : local_min;
+}
+
 void Engine::note_leader_contact() {
   ever_contacted_ = true;
   last_leader_contact_ = now_;
@@ -825,7 +869,7 @@ bool Engine::update_vote(StepResult& out, const Vote& incoming) {
     return true;
   }
 
-  step_down();
+  step_down(out);
   const bool self_campaign = campaign_ && campaign_->vote == vote_;
   if (self_campaign) {
     role_ = Role::Candidate;
@@ -865,12 +909,183 @@ void Engine::become_leader(StepResult& out) {
   replicate_all(out);
 }
 
-void Engine::step_down() {
+void Engine::step_down(StepResult& out) {
+  abort_reads(out);
   if (leading_) {
     leading_ = false;
     progress_.clear();
   }
   role_ = Role::Follower;
+}
+
+bool Engine::current_term_committed() const {
+  if (!leading_ || commit_index_ == 0) {
+    return false;
+  }
+  if (const LogEntry* entry = find(commit_index_)) {
+    return entry->id.term == vote_.leader.term && entry->id.node == id_;
+  }
+  // The committed prefix was compacted. A snapshot last included by this
+  // leader in this term is enough; an older image is not.
+  if (snapshot_ && snapshot_->meta.last_included.index >= commit_index_) {
+    const LogId& included = snapshot_->meta.last_included;
+    return included.term == vote_.leader.term && included.node == id_;
+  }
+  return false;
+}
+
+bool Engine::acks_commit_quorum(const std::set<NodeId>& acks) const {
+  return membership_.is_commit_quorum([&](NodeId voter) {
+    return voter == id_ || acks.find(voter) != acks.end();
+  });
+}
+
+void Engine::begin_confirmation(StepResult& out, PendingRead& read) {
+  if (read.aborted || read.confirmed) {
+    return;
+  }
+  ++heartbeat_seq_;
+  read.confirm_seq = heartbeat_seq_;
+  read.confirming = true;
+  read.acks.clear();
+  ticks_since_heartbeat_ = 0;
+  // A commit quorum of one is this node alone. No ack round is required.
+  if (!read.needs_anchor && acks_commit_quorum(read.acks)) {
+    read.confirmed = true;
+    return;
+  }
+  replicate_all(out);
+}
+
+void Engine::assign_read_anchors() {
+  if (!leading_ || !current_term_committed()) {
+    return;
+  }
+  for (PendingRead& read : reads_) {
+    if (read.aborted || !read.needs_anchor) {
+      continue;
+    }
+    read.needs_anchor = false;
+    read.read_index = commit_index_;
+    if (!read.confirmed && read.confirming && acks_commit_quorum(read.acks)) {
+      read.confirmed = true;
+    }
+  }
+}
+
+void Engine::note_read_ack(StepResult& out, NodeId from, std::uint64_t seq) {
+  // Learners are not voters, so they cannot confirm a read.
+  if (!leading_ || !membership_.contains(from)) {
+    return;
+  }
+  for (PendingRead& read : reads_) {
+    if (read.aborted || !read.confirming || seq < read.confirm_seq) {
+      continue;
+    }
+    read.acks.insert(from);
+    if (!read.needs_anchor && !read.confirmed && acks_commit_quorum(read.acks)) {
+      read.confirmed = true;
+    }
+  }
+  serve_reads(out);
+}
+
+void Engine::serve_reads(StepResult& out) {
+  if (!leading_ || role_ != Role::Leader) {
+    return;
+  }
+  std::vector<PendingRead> kept;
+  kept.reserve(reads_.size());
+  for (PendingRead& read : reads_) {
+    if (read.aborted) {
+      continue;
+    }
+    const bool servable = read.confirmed && !read.needs_anchor && read.read_index.has_value() &&
+                          last_applied_ >= *read.read_index;
+    if (!servable) {
+      kept.push_back(std::move(read));
+      continue;
+    }
+    Command command;
+    command.kind = CommandKind::ReadReady;
+    command.read_id = read.id;
+    command.index = *read.read_index;
+    out.commands.push_back(std::move(command));
+  }
+  reads_.swap(kept);
+}
+
+void Engine::abort_reads(StepResult& out) {
+  for (const PendingRead& read : reads_) {
+    if (read.aborted) {
+      continue;
+    }
+    Command command;
+    command.kind = CommandKind::ReadAborted;
+    command.read_id = read.id;
+    out.commands.push_back(std::move(command));
+  }
+  reads_.clear();
+}
+
+ReadStart Engine::begin_linearizable_read() {
+  ReadStart started;
+  if (!initialized_ || !leading_ || role_ != Role::Leader) {
+    return started;
+  }
+  if (reads_.size() >= config_.max_in_flight_reads) {
+    started.capped = true;
+    return started;
+  }
+  PendingRead read;
+  read.id = next_read_id_++;
+  read.needs_anchor = !current_term_committed();
+  if (!read.needs_anchor) {
+    read.read_index = commit_index_;
+  }
+  const std::uint64_t id = read.id;
+  reads_.push_back(std::move(read));
+  begin_confirmation(started.step, reads_.back());
+  serve_reads(started.step);
+  started.accepted = true;
+  started.id = id;
+  return started;
+}
+
+bool Engine::cancel_linearizable_read(std::uint64_t id) {
+  for (auto it = reads_.begin(); it != reads_.end(); ++it) {
+    if (it->id != id) {
+      continue;
+    }
+    reads_.erase(it);
+    return true;
+  }
+  return false;
+}
+
+bool Engine::linearizable_read_pending(std::uint64_t id) const {
+  for (const PendingRead& read : reads_) {
+    if (read.id == id && !read.aborted) {
+      return true;
+    }
+  }
+  return false;
+}
+
+Result<LogIndex> Engine::lease_read() const {
+  if (!initialized_) {
+    return Result<LogIndex>::failure(Error::NotInitialized);
+  }
+  if (!leading_ || role_ != Role::Leader) {
+    return Result<LogIndex>::failure(Error::NotLeader);
+  }
+  if (!leader_read_lease_valid()) {
+    return Result<LogIndex>::failure(Error::LeaseExpired);
+  }
+  if (!current_term_committed() || last_applied_ < commit_index_) {
+    return Result<LogIndex>::failure(Error::Rejected);
+  }
+  return Result<LogIndex>::success(commit_index_);
 }
 
 void Engine::append_local(StepResult& out, EntryKind kind, std::string data) {
@@ -979,6 +1194,8 @@ void Engine::advance_commit(StepResult& out) {
       enqueue_applies(out);
       continue_membership(out);
       maybe_auto_snapshot(out);
+      assign_read_anchors();
+      serve_reads(out);
       return;
     }
   }
@@ -1021,6 +1238,8 @@ void Engine::send_append(StepResult& out, NodeId to) {
   AppendEntriesRequest request;
   request.vote = vote_;
   request.leader_commit = commit_index_;
+  request.heartbeat_seq = heartbeat_seq_;
+  request.sent_tick = now_;
   const LogIndex next = progress.next_index;
   if (next > 1) {
     if (const LogEntry* prev = find(next - 1)) {
@@ -1095,7 +1314,7 @@ void Engine::elect(StepResult& out) {
   if (leading_ && leader_quorum_lease_valid()) {
     return;
   }
-  step_down();
+  step_down(out);
   Vote candidate_vote;
   candidate_vote.leader.term = vote_.leader.term + 1;
   candidate_vote.leader.node = id_;
@@ -1226,7 +1445,7 @@ void Engine::continue_membership(StepResult& out) {
     }
     if (!decoded->is_joint()) {
       if (!decoded->contains(id_)) {
-        step_down();
+        step_down(out);
         campaign_.reset();
         pre_campaign_.reset();
       }
@@ -1435,6 +1654,8 @@ InstallStep Engine::on_install(const InstallSnapshotRequest& request) {
   step.response.responder_vote = vote_;
   step.response.follower_index = last_applied_;
   step.response.snapshot_id = request.meta.snapshot_id;
+  step.response.sent_tick = request.sent_tick;
+  step.response.voter_timeout_min = static_cast<std::uint64_t>(config_.election_timeout_min);
   if (!initialized_) {
     step.response.rejected_by_vote = true;
     return step;
@@ -1536,6 +1757,7 @@ StepResult Engine::on_install_response(NodeId from, const InstallSnapshotRespons
     progress.next_index = progress.match_index + 1;
     progress.snapshot_offset = 0;
     progress.last_ack_tick = now_;
+    note_read_lease(progress, response.sent_tick, response.voter_timeout_min);
     const LogIndex before = commit_index_;
     advance_commit(out);
     if (commit_index_ > before) {
@@ -1548,6 +1770,7 @@ StepResult Engine::on_install_response(NodeId from, const InstallSnapshotRespons
   if (response.success) {
     progress.snapshot_offset = response.received;
     progress.last_ack_tick = now_;
+    note_read_lease(progress, response.sent_tick, response.voter_timeout_min);
     send_append(out, from);
     return out;
   }
@@ -1583,6 +1806,7 @@ void Engine::send_snapshot(StepResult& out, NodeId to) {
   request.offset = progress.snapshot_offset;
   request.data = snapshot_->data.substr(offset, chunk);
   request.done = progress.snapshot_offset + static_cast<std::uint64_t>(chunk) == snapshot_->data.size();
+  request.sent_tick = now_;
   Outbound message;
   message.to = to;
   message.payload = std::move(request);

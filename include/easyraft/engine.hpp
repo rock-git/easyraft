@@ -4,6 +4,7 @@
 #pragma once
 
 #include "easyraft/config.hpp"
+#include "easyraft/error.hpp"
 #include "easyraft/messages.hpp"
 #include "easyraft/types.hpp"
 
@@ -29,6 +30,11 @@ enum class CommandKind {
   SaveSnapshot,
   // Drop log entries at or below `index` once `SaveSnapshot` has succeeded.
   Purge,
+  // A linearizable read may be served at `index`. `read_id` identifies it.
+  // The runtime observes this only after Apply commands for that index.
+  ReadReady,
+  // `read_id` will not become ready. Leadership was lost first.
+  ReadAborted,
 };
 
 struct Command {
@@ -40,6 +46,8 @@ struct Command {
   LogEntry entry{};
   Snapshot snapshot{};
   bool build_snapshot{false};
+  // Set on ReadReady and ReadAborted.
+  std::uint64_t read_id{0};
 };
 
 struct Outbound {
@@ -76,6 +84,16 @@ struct InstallStep {
 struct SnapshotBuild {
   StepResult step;
   bool started{false};
+};
+
+// A linearizable read accepted by the leader. Heartbeats, when a peer quorum
+// is required, are in `step.outbound`. `id` is polled until ReadReady.
+struct ReadStart {
+  StepResult step;
+  bool accepted{false};
+  // The leader already has `max_in_flight_reads` linearizable reads outstanding.
+  bool capped{false};
+  std::uint64_t id{0};
 };
 
 // Pure Raft state machine. Time advances only through on_tick(); no wall clock.
@@ -126,6 +144,27 @@ class Engine {
   // Joint consensus removes `voter` and the uniform target adds it as a
   // learner. During the joint config it is still a voter.
   ProposeResult demote_voter(NodeId voter);
+  // Leader only. Records the commit index once this term has a committed
+  // entry (the blank entry, if that is still all this leader has committed),
+  // then confirms leadership with AppendEntries acks from a commit quorum of
+  // every voter config. Learners are not part of that quorum. `accepted` is
+  // false when this node is not the leader. The read is not served until
+  // `last_applied` reaches the recorded index.
+  ReadStart begin_linearizable_read();
+  // Drops a read that has not yet been served. A served read is already gone
+  // from the engine; the runtime still has to drop its own copy.
+  bool cancel_linearizable_read(std::uint64_t id);
+  bool linearizable_read_pending(std::uint64_t id) const;
+  std::size_t max_in_flight_reads() const { return config_.max_in_flight_reads; }
+  // Leader only. The read lease is the vote-rejection lease narrowed to real
+  // AppendEntries and InstallSnapshot acks. Each ack expires `election_timeout_min`
+  // ticks after the leader sent the request, and sooner when the voter reports
+  // a shorter minimum. Timestamps written at election, before any ack, do not
+  // count. One tick must have the same duration on every node; this engine has
+  // no wall clock and does not correct drift. `LeaseExpired` does not return
+  // state and does not start a quorum round. `Rejected` means the lease is
+  // valid but this term has not yet committed an entry through `last_applied`.
+  Result<LogIndex> lease_read() const;
 
   VoteStep on_pre_vote(const VoteRequest& request);
   StepResult on_pre_vote_response(NodeId from, const PreVoteResponse& response);
@@ -159,7 +198,15 @@ class Engine {
   struct Progress {
     LogIndex next_index{1};
     LogIndex match_index{0};
+    // Vote-rejection lease. Set when leadership starts, then refreshed when a
+    // reply arrives. Read leases do not use this stamp.
     std::uint64_t last_ack_tick{0};
+    // Set only by a real AppendEntries or InstallSnapshot ack. `read_ack_send_tick`
+    // is the leader tick copied onto that request. `read_ack_timeout` is the
+    // shorter of this node's election_timeout_min and the voter's.
+    bool read_acked{false};
+    std::uint64_t read_ack_send_tick{0};
+    std::uint64_t read_ack_timeout{0};
     std::uint64_t snapshot_offset{0};
     std::string snapshot_id;
   };
@@ -175,6 +222,20 @@ class Engine {
     std::uint64_t probe{0};
   };
 
+  // One client linearizable read. `read_index` stays empty until this leader
+  // has committed an entry from its current term. Acks are voters whose
+  // AppendEntries response carried `heartbeat_seq >= confirm_seq`.
+  struct PendingRead {
+    std::uint64_t id{0};
+    std::optional<LogIndex> read_index;
+    bool needs_anchor{false};
+    bool confirming{false};
+    std::uint64_t confirm_seq{0};
+    std::set<NodeId> acks;
+    bool confirmed{false};
+    bool aborted{false};
+  };
+
   const LogEntry* find(LogIndex index) const;
   std::optional<LogId> last_log_id() const;
   bool has_quorum(const std::set<NodeId>& grants) const;
@@ -182,10 +243,19 @@ class Engine {
   std::uint64_t sample_timeout();
   bool follower_lease_valid() const;
   bool leader_quorum_lease_valid() const;
+  bool leader_read_lease_valid() const;
+  void note_read_lease(Progress& progress, std::uint64_t sent_tick, std::uint64_t voter_min);
   void note_leader_contact();
   bool update_vote(StepResult& out, const Vote& incoming);
   void become_leader(StepResult& out);
-  void step_down();
+  void step_down(StepResult& out);
+  bool current_term_committed() const;
+  bool acks_commit_quorum(const std::set<NodeId>& acks) const;
+  void begin_confirmation(StepResult& out, PendingRead& read);
+  void assign_read_anchors();
+  void note_read_ack(StepResult& out, NodeId from, std::uint64_t seq);
+  void serve_reads(StepResult& out);
+  void abort_reads(StepResult& out);
   void append_local(StepResult& out, EntryKind kind, std::string data);
   void truncate_from(StepResult& out, LogIndex index);
   void advance_commit(StepResult& out);
@@ -229,6 +299,9 @@ class Engine {
   LogIndex commit_index_{0};
   LogIndex last_applied_{0};
   std::uint64_t now_{0};
+  // Copied onto AppendEntries and echoed by the follower. Read confirmation
+  // bumps it so an older in-flight ack cannot be counted.
+  std::uint64_t heartbeat_seq_{0};
   std::uint64_t election_timeout_ticks_{1};
   std::uint64_t next_election_at_{1};
   std::uint64_t ticks_since_heartbeat_{0};
@@ -239,6 +312,8 @@ class Engine {
   std::optional<Campaign> pre_campaign_;
   std::uint64_t next_probe_{0};
   std::map<NodeId, Progress> progress_;
+  std::vector<PendingRead> reads_;
+  std::uint64_t next_read_id_{1};
 };
 
 }  // namespace easyraft

@@ -247,6 +247,107 @@ Result<LogIndex> RaftNode::demote_voter(NodeId voter) {
   return finish_membership(engine_.demote_voter(voter));
 }
 
+Result<std::uint64_t> RaftNode::linearizable_read() {
+  if (failed_) {
+    return Result<std::uint64_t>::failure(Error::Storage);
+  }
+  if (!initialized_) {
+    return Result<std::uint64_t>::failure(Error::NotInitialized);
+  }
+  if (role() != Role::Leader) {
+    return Result<std::uint64_t>::failure(Error::NotLeader);
+  }
+  if (tracked_reads() >= engine_.max_in_flight_reads()) {
+    return Result<std::uint64_t>::failure(Error::Rejected);
+  }
+  const ReadStart started = engine_.begin_linearizable_read();
+  if (!started.accepted) {
+    return Result<std::uint64_t>::failure(started.capped ? Error::Rejected : Error::NotLeader);
+  }
+  outstanding_reads_.insert(started.id);
+  try {
+    apply(started.step);
+  } catch (const std::runtime_error&) {
+    return Result<std::uint64_t>::failure(Error::Storage);
+  }
+  if (failed_) {
+    return Result<std::uint64_t>::failure(Error::Storage);
+  }
+  return Result<std::uint64_t>::success(started.id);
+}
+
+Result<LogIndex> RaftNode::lease_read() {
+  if (failed_) {
+    return Result<LogIndex>::failure(Error::Storage);
+  }
+  if (!initialized_) {
+    return Result<LogIndex>::failure(Error::NotInitialized);
+  }
+  const Result<LogIndex> result = engine_.lease_read();
+  if (!result.ok()) {
+    return result;
+  }
+  // The engine cursor moves before apply callbacks run. Trust the state
+  // machine's own cursor, which is still behind inside that callback.
+  if (state_machine_ == nullptr || state_machine_->last_applied() < result.value()) {
+    return Result<LogIndex>::failure(Error::Rejected);
+  }
+  return result;
+}
+
+Result<void> RaftNode::cancel_read(std::uint64_t id) {
+  if (failed_) {
+    return Result<void>::failure(Error::Storage);
+  }
+  if (!initialized_) {
+    return Result<void>::failure(Error::NotInitialized);
+  }
+  const bool in_engine = engine_.cancel_linearizable_read(id);
+  const bool outstanding = outstanding_reads_.erase(id) != 0;
+  const bool ready = ready_reads_.erase(id) != 0;
+  const bool aborted = aborted_reads_.erase(id) != 0;
+  std::vector<Command> kept;
+  kept.reserve(deferred_reads_.size());
+  bool deferred = false;
+  for (const Command& command : deferred_reads_) {
+    if (command.read_id == id) {
+      deferred = true;
+      continue;
+    }
+    kept.push_back(command);
+  }
+  deferred_reads_.swap(kept);
+  if (!in_engine && !outstanding && !ready && !aborted && !deferred) {
+    return Result<void>::failure(Error::Rejected);
+  }
+  return Result<void>::success();
+}
+
+Result<LogIndex> RaftNode::poll_linearizable_read(std::uint64_t id) {
+  if (failed_) {
+    return Result<LogIndex>::failure(Error::Storage);
+  }
+  if (!initialized_) {
+    return Result<LogIndex>::failure(Error::NotInitialized);
+  }
+  const auto ready = ready_reads_.find(id);
+  if (ready != ready_reads_.end()) {
+    const LogIndex index = ready->second;
+    ready_reads_.erase(ready);
+    return Result<LogIndex>::success(index);
+  }
+  if (aborted_reads_.erase(id) != 0) {
+    return Result<LogIndex>::failure(Error::NotLeader);
+  }
+  if (outstanding_reads_.find(id) != outstanding_reads_.end()) {
+    return Result<LogIndex>::failure(Error::Pending);
+  }
+  if (role() != Role::Leader) {
+    return Result<LogIndex>::failure(Error::NotLeader);
+  }
+  return Result<LogIndex>::failure(Error::Rejected);
+}
+
 Result<void> RaftNode::trigger_snapshot() {
   if (failed_) {
     return Result<void>::failure(Error::Storage);
@@ -309,6 +410,11 @@ void RaftNode::apply(const StepResult& step) {
   if (failed_) {
     return;
   }
+  // Nested calls, including a read started from an apply callback, only append
+  // to `deferred_reads_`. Publication waits until the outermost call returns
+  // and the state-machine cursor covers the index.
+  ++apply_depth_;
+  std::vector<Command> reads;
   try {
     for (const Command& command : step.commands) {
       switch (command.kind) {
@@ -340,17 +446,68 @@ void RaftNode::apply(const StepResult& step) {
         case CommandKind::Purge:
           check(storage_->purge_through(command.index));
           break;
+        case CommandKind::ReadReady:
+        case CommandKind::ReadAborted:
+          reads.push_back(command);
+          break;
       }
     }
   } catch (const std::runtime_error&) {
     // The engine shadow already moved. Refuse every later RPC and proposal so
     // a retry cannot acknowledge state that never reached storage.
     failed_ = true;
+    --apply_depth_;
     throw;
   }
+  deferred_reads_.insert(deferred_reads_.end(), reads.begin(), reads.end());
   for (const Outbound& message : step.outbound) {
     send(message.to, message.payload);
   }
+  --apply_depth_;
+  if (apply_depth_ == 0 && !failed_) {
+    flush_reads();
+  }
+}
+
+void RaftNode::flush_reads() {
+  std::vector<Command> held;
+  for (const Command& command : deferred_reads_) {
+    if (command.kind == CommandKind::ReadAborted) {
+      std::vector<Command> still;
+      still.reserve(held.size());
+      for (const Command& waiting : held) {
+        if (waiting.read_id != command.read_id) {
+          still.push_back(waiting);
+        }
+      }
+      held.swap(still);
+      publish_read(command);
+      continue;
+    }
+    if (command.kind == CommandKind::ReadReady &&
+        (state_machine_ == nullptr || state_machine_->last_applied() < command.index)) {
+      held.push_back(command);
+      continue;
+    }
+    publish_read(command);
+  }
+  deferred_reads_.swap(held);
+}
+
+void RaftNode::publish_read(const Command& command) {
+  if (command.kind == CommandKind::ReadReady) {
+    aborted_reads_.erase(command.read_id);
+    ready_reads_[command.read_id] = command.index;
+    outstanding_reads_.erase(command.read_id);
+  } else if (command.kind == CommandKind::ReadAborted) {
+    ready_reads_.erase(command.read_id);
+    outstanding_reads_.erase(command.read_id);
+    aborted_reads_.insert(command.read_id);
+  }
+}
+
+std::size_t RaftNode::tracked_reads() const {
+  return outstanding_reads_.size() + ready_reads_.size() + aborted_reads_.size();
 }
 
 void RaftNode::send(NodeId to, Payload payload) {
