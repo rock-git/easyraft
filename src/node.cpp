@@ -273,6 +273,16 @@ Result<std::uint64_t> RaftNode::linearizable_read() {
   return Result<std::uint64_t>::success(started.id);
 }
 
+Result<LogIndex> RaftNode::lease_read() {
+  if (failed_) {
+    return Result<LogIndex>::failure(Error::Storage);
+  }
+  if (!initialized_) {
+    return Result<LogIndex>::failure(Error::NotInitialized);
+  }
+  return engine_.lease_read();
+}
+
 Result<LogIndex> RaftNode::poll_linearizable_read(std::uint64_t id) {
   if (failed_) {
     return Result<LogIndex>::failure(Error::Storage);

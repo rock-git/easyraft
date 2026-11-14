@@ -67,6 +67,13 @@ class RaftNode {
   // `Rejected` means the id was never started on this node.
   Result<std::uint64_t> linearizable_read();
   Result<LogIndex> poll_linearizable_read(std::uint64_t id);
+  // Leader only, while the existing leader lease is valid. Returns the
+  // applied commit index without a new quorum round. `LeaseExpired` means
+  // the lease does not cover the read: no state is returned, and the call
+  // does not fall back to `linearizable_read`. `Rejected` means the lease is
+  // valid but this term's commit is not applied yet. Followers and learners
+  // return `NotLeader`.
+  Result<LogIndex> lease_read();
   void tick();
 
   void on_message(const Envelope& message);

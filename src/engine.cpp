@@ -1016,6 +1016,25 @@ bool Engine::linearizable_read_pending(std::uint64_t id) const {
   return false;
 }
 
+Result<LogIndex> Engine::lease_read() const {
+  if (!initialized_) {
+    return Result<LogIndex>::failure(Error::NotInitialized);
+  }
+  if (!leading_ || role_ != Role::Leader) {
+    return Result<LogIndex>::failure(Error::NotLeader);
+  }
+  // Same lease that refuses a disruptive vote: a commit quorum of voters,
+  // including this node, has acknowledged the leader inside this node's
+  // election timeout. Learners are not in that quorum.
+  if (!leader_quorum_lease_valid()) {
+    return Result<LogIndex>::failure(Error::LeaseExpired);
+  }
+  if (!current_term_committed() || last_applied_ < commit_index_) {
+    return Result<LogIndex>::failure(Error::Rejected);
+  }
+  return Result<LogIndex>::success(commit_index_);
+}
+
 void Engine::append_local(StepResult& out, EntryKind kind, std::string data) {
   LogEntry entry;
   entry.id.term = vote_.leader.term;
