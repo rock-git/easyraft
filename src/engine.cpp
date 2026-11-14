@@ -229,11 +229,88 @@ ProposeResult Engine::change_membership(std::vector<NodeId> voters) {
     result.index = last_index_;
     return result;
   }
-  const Membership joint = Membership::joint_of(membership_.voters(), std::move(voters));
+  const std::vector<NodeId> prior = membership_.learners();
+  const Membership joint =
+      Membership::joint_of(membership_.voters(), std::move(voters), membership_.learners());
   const LogIndex joint_index = last_index_ + 1;
-  append_local(result.step, EntryKind::Membership, joint.encode());
+  append_local(result.step, EntryKind::Membership, joint.encode_for_log(prior));
   result.accepted = true;
   result.index = joint_index;
+  replicate_all(result.step);
+  return result;
+}
+
+ProposeResult Engine::add_learner(NodeId learner) {
+  ProposeResult result;
+  if (!initialized_ || !leading_ || role_ != Role::Leader || membership_changing()) {
+    return result;
+  }
+  if (learner == 0 || membership_.empty() || membership_.is_joint() ||
+      membership_.contains(learner) || membership_.is_learner(learner)) {
+    return result;
+  }
+  const std::vector<NodeId> prior = membership_.learners();
+  std::vector<NodeId> learners = prior;
+  learners.push_back(learner);
+  const Membership next{membership_.voters(), std::move(learners)};
+  const LogIndex index = last_index_ + 1;
+  append_local(result.step, EntryKind::Membership, next.encode_for_log(prior));
+  result.accepted = true;
+  result.index = index;
+  replicate_all(result.step);
+  return result;
+}
+
+ProposeResult Engine::remove_learner(NodeId learner) {
+  ProposeResult result;
+  if (!initialized_ || !leading_ || role_ != Role::Leader || membership_changing()) {
+    return result;
+  }
+  if (!membership_.is_learner(learner) || membership_.is_joint()) {
+    return result;
+  }
+  const std::vector<NodeId> prior = membership_.learners();
+  std::vector<NodeId> learners;
+  learners.reserve(prior.size());
+  for (NodeId id : prior) {
+    if (id != learner) {
+      learners.push_back(id);
+    }
+  }
+  const Membership next{membership_.voters(), std::move(learners)};
+  const LogIndex index = last_index_ + 1;
+  append_local(result.step, EntryKind::Membership, next.encode_for_log(prior));
+  result.accepted = true;
+  result.index = index;
+  replicate_all(result.step);
+  return result;
+}
+
+ProposeResult Engine::demote_voter(NodeId voter) {
+  ProposeResult result;
+  if (!initialized_ || !leading_ || role_ != Role::Leader || membership_changing()) {
+    return result;
+  }
+  if (voter == 0 || membership_.is_joint() || !membership_.contains(voter) ||
+      membership_.voters().size() < 2) {
+    return result;
+  }
+  std::vector<NodeId> voters;
+  voters.reserve(membership_.voters().size() - 1);
+  for (NodeId id : membership_.voters()) {
+    if (id != voter) {
+      voters.push_back(id);
+    }
+  }
+  const std::vector<NodeId> prior = membership_.learners();
+  std::vector<NodeId> after = prior;
+  after.push_back(voter);
+  const Membership joint =
+      Membership::joint_of(membership_.voters(), std::move(voters), prior, std::move(after));
+  const LogIndex index = last_index_ + 1;
+  append_local(result.step, EntryKind::Membership, joint.encode_for_log(prior));
+  result.accepted = true;
+  result.index = index;
   replicate_all(result.step);
   return result;
 }
@@ -587,6 +664,15 @@ std::string Engine::debug() const {
     }
     out << "]";
   }
+  out << " learners=[";
+  const std::vector<NodeId>& learners = membership_.learners();
+  for (std::size_t i = 0; i < learners.size(); ++i) {
+    if (i != 0) {
+      out << ",";
+    }
+    out << learners[i];
+  }
+  out << "]";
   return out.str();
 }
 
@@ -721,15 +807,12 @@ void Engine::become_leader(StepResult& out) {
   // leaders commit only once this entry (or a later one of ours) is on a
   // majority. That is the Raft rule OpenRaft keeps.
   append_local(out, EntryKind::Blank, {});
-  for (NodeId voter : membership_.voters()) {
-    if (voter == id_) {
-      continue;
-    }
+  for (NodeId peer : peers()) {
     Progress progress;
     progress.next_index = std::max<LogIndex>(last_index_, 1);
     progress.match_index = 0;
     progress.last_ack_tick = now_;
-    progress_.emplace(voter, progress);
+    progress_.emplace(peer, progress);
   }
   replicate_all(out);
 }
@@ -829,8 +912,9 @@ void Engine::advance_commit(StepResult& out) {
   if (!leading_ || membership_.empty()) {
     return;
   }
-  // The highest index stored on a majority of every config. Self is fully
-  // caught up. One pass over the voters, not over the uncommitted suffix.
+  // The highest index stored on a majority of every voter config. Self is
+  // fully caught up. Learners are not in those configs, so their match index
+  // cannot move commit. One pass over the voters, not the uncommitted suffix.
   const std::optional<LogIndex> agreed = quorum_match_index();
   if (!agreed || *agreed <= commit_index_) {
     return;
@@ -850,15 +934,18 @@ void Engine::advance_commit(StepResult& out) {
   }
 }
 
+std::vector<NodeId> Engine::peers() const {
+  std::vector<NodeId> ids = membership_.replication_targets();
+  ids.erase(std::remove(ids.begin(), ids.end(), id_), ids.end());
+  return ids;
+}
+
 void Engine::replicate_all(StepResult& out) {
   if (!leading_) {
     return;
   }
-  for (NodeId voter : membership_.voters()) {
-    if (voter == id_) {
-      continue;
-    }
-    send_append(out, voter);
+  for (NodeId peer : peers()) {
+    send_append(out, peer);
   }
 }
 
@@ -874,8 +961,8 @@ void Engine::send_append(StepResult& out, NodeId to) {
   if (progress.next_index > last_index_ + 1) {
     progress.next_index = last_index_ + 1;
   }
-  // The prefix was purged. A new voter starts at index 1 and takes this path
-  // once a snapshot exists.
+  // The prefix was purged. A new voter or learner starts at index 1 and takes
+  // this path once a snapshot exists.
   if (progress.next_index < first_available_index()) {
     send_snapshot(out, to);
     return;
@@ -997,10 +1084,20 @@ Membership Engine::infer_base(const Membership& stored) const {
       continue;
     }
     const std::optional<Membership> decoded = Membership::decode(entry.data);
-    if (!decoded || !decoded->is_joint() || decoded->configs().size() != 2) {
+    if (!decoded) {
       return stored;
     }
-    return Membership{decoded->configs().front()};
+    // The entry records the learner set from before it was appended. A
+    // version-1 joint entry has no learners, so the old voter config is enough.
+    if (decoded->is_joint() && decoded->configs().size() == 2) {
+      const std::vector<NodeId>& base_learners =
+          decoded->has_prior_learners() ? decoded->prior_learners() : decoded->learners();
+      return Membership{decoded->configs().front(), base_learners};
+    }
+    if (decoded->has_prior_learners()) {
+      return Membership{decoded->voters(), decoded->prior_learners()};
+    }
+    return stored;
   }
   return stored;
 }
@@ -1022,8 +1119,8 @@ void Engine::sync_progress() {
   if (!leading_) {
     return;
   }
-  std::set<NodeId> wanted(membership_.voters().begin(), membership_.voters().end());
-  wanted.erase(id_);
+  const std::vector<NodeId> peer_ids = peers();
+  std::set<NodeId> wanted(peer_ids.begin(), peer_ids.end());
   for (auto it = progress_.begin(); it != progress_.end();) {
     if (wanted.find(it->first) == wanted.end()) {
       it = progress_.erase(it);
@@ -1056,38 +1153,42 @@ void Engine::continue_membership(StepResult& out) {
       latest = &entry;
     }
   }
+  const Membership* joint = nullptr;
+  std::optional<Membership> decoded;
   if (latest == nullptr) {
     // A committed joint can live only in the snapshot after the entry was purged.
     if (!snapshot_ || !snapshot_->meta.membership.is_joint() ||
         snapshot_->meta.membership.configs().size() != 2) {
       return;
     }
-    const Membership uniform{snapshot_->meta.membership.configs()[1]};
-    append_local(out, EntryKind::Membership, uniform.encode());
-    return;
-  }
-  if (latest->id.index > commit_index_) {
-    return;
-  }
-  std::optional<Membership> decoded = Membership::decode(latest->data);
-  if (!decoded) {
-    return;
-  }
-  if (decoded->is_joint()) {
+    joint = &snapshot_->meta.membership;
+  } else {
+    if (latest->id.index > commit_index_) {
+      return;
+    }
+    decoded = Membership::decode(latest->data);
+    if (!decoded) {
+      return;
+    }
+    if (!decoded->is_joint()) {
+      if (!decoded->contains(id_)) {
+        step_down();
+        campaign_.reset();
+        pre_campaign_.reset();
+      }
+      return;
+    }
     if (decoded->configs().size() != 2) {
       return;
     }
-    // The uniform target becomes effective when it is appended. It commits
-    // under that new config, which no longer requires the old voters.
-    const Membership uniform{decoded->configs()[1]};
-    append_local(out, EntryKind::Membership, uniform.encode());
-    return;
+    joint = &*decoded;
   }
-  if (!decoded->contains(id_)) {
-    step_down();
-    campaign_.reset();
-    pre_campaign_.reset();
-  }
+  // The uniform target becomes effective when it is appended. It commits
+  // under that new config, which no longer requires the old voters. Learners
+  // carry forward, including a voter demoted into the learner set.
+  const std::vector<NodeId> prior = joint->learners();
+  const Membership uniform{joint->configs()[1], joint->learners_after_joint()};
+  append_local(out, EntryKind::Membership, uniform.encode_for_log(prior));
 }
 
 void Engine::establish_leader(StepResult& out) {

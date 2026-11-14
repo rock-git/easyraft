@@ -107,9 +107,18 @@ class Engine {
   // One replication pass. A leader uses this after a snapshot's bytes are stored.
   StepResult replicate_now();
   // Appends a joint config of the current voters and `voters`, then the
-  // uniform target once that joint entry commits. `accepted` is false when
-  // this node cannot start a change. The returned index is the joint entry.
+  // uniform target once that joint entry commits. Learners stay learners,
+  // except one named in `voters`: that node is promoted and leaves the
+  // learner set. `accepted` is false when this node cannot start a change.
+  // The returned index is the joint entry.
   ProposeResult change_membership(std::vector<NodeId> voters);
+  // One uniform membership entry. Learners do not vote, so this does not
+  // enter joint consensus. The returned index is that entry.
+  ProposeResult add_learner(NodeId learner);
+  ProposeResult remove_learner(NodeId learner);
+  // Joint consensus removes `voter` and the uniform target adds it as a
+  // learner. During the joint config it is still a voter.
+  ProposeResult demote_voter(NodeId voter);
 
   VoteStep on_pre_vote(const VoteRequest& request);
   StepResult on_pre_vote_response(NodeId from, const PreVoteResponse& response);
@@ -182,6 +191,7 @@ class Engine {
   void start_snapshot(StepResult& out);
   void install_snapshot(StepResult& out, Snapshot snapshot);
   Membership membership_at(LogIndex index) const;
+  std::vector<NodeId> peers() const;
   void replicate_all(StepResult& out);
   void send_append(StepResult& out, NodeId to);
   void send_snapshot(StepResult& out, NodeId to);
