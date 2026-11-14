@@ -4,6 +4,7 @@
 #pragma once
 
 #include "easyraft/config.hpp"
+#include "easyraft/error.hpp"
 #include "easyraft/messages.hpp"
 #include "easyraft/types.hpp"
 
@@ -149,6 +150,12 @@ class Engine {
   // `last_applied` reaches the recorded index.
   ReadStart begin_linearizable_read();
   bool linearizable_read_pending(std::uint64_t id) const;
+  // Leader only, and only while `leader_quorum_lease_valid` is still true.
+  // Returns the applied commit index. `LeaseExpired` when the existing lease
+  // does not cover the read; the call does not return state and does not
+  // start a quorum round. `Rejected` when the lease is valid but this term
+  // has not yet committed and applied an entry. Followers return `NotLeader`.
+  Result<LogIndex> lease_read() const;
 
   VoteStep on_pre_vote(const VoteRequest& request);
   StepResult on_pre_vote_response(NodeId from, const PreVoteResponse& response);

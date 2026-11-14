@@ -24,6 +24,9 @@ enum class Error {
   // A linearizable read has been accepted and is waiting for a commit quorum
   // or for the state machine to apply its read index.
   Pending,
+  // The leader's existing lease does not cover a local read. The call does
+  // not return applied state and does not fall back to a quorum read.
+  LeaseExpired,
 };
 
 inline const char* to_string(Error error) {
@@ -44,6 +47,8 @@ inline const char* to_string(Error error) {
       return "rejected";
     case Error::Pending:
       return "pending";
+    case Error::LeaseExpired:
+      return "lease expired";
   }
   return "unknown";
 }
