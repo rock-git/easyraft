@@ -37,7 +37,7 @@ std::uint64_t prevote_probe(const StepResult& step) {
 
 void become_leader(Engine& engine) {
   std::uint64_t probe = 0;
-  for (int tick = 0; tick < 8 && engine.role() != Role::Leader; ++tick) {
+  for (int tick = 0; tick < 40 && engine.role() != Role::Leader; ++tick) {
     probe = std::max(probe, prevote_probe(engine.on_tick()));
     if (probe != 0 && engine.role() != Role::Leader && engine.term() == 0) {
       PreVoteResponse grant;
@@ -54,22 +54,33 @@ void become_leader(Engine& engine) {
   }
 }
 
-std::uint64_t sent_seq(const StepResult& step) {
+struct SentHeartbeat {
+  std::uint64_t seq{0};
+  std::uint64_t sent_tick{0};
+};
+
+SentHeartbeat sent_heartbeat(const StepResult& step) {
+  SentHeartbeat sent;
   for (const Outbound& message : step.outbound) {
     if (const auto* request = std::get_if<AppendEntriesRequest>(&message.payload)) {
-      return request->heartbeat_seq;
+      sent.seq = request->heartbeat_seq;
+      sent.sent_tick = request->sent_tick;
+      return sent;
     }
   }
-  return 0;
+  return sent;
 }
 
-StepResult ack_seq(Engine& engine, NodeId from, std::uint64_t seq) {
+StepResult ack_seq(Engine& engine, NodeId from, std::uint64_t seq, std::uint64_t sent_tick,
+                   std::uint64_t voter_min) {
   AppendEntriesResponse response;
   response.success = true;
   response.request_vote = engine.vote();
   response.responder_vote = engine.vote().non_committed();
   response.match_index = engine.last_index();
   response.heartbeat_seq = seq;
+  response.sent_tick = sent_tick;
+  response.voter_timeout_min = voter_min;
   return engine.on_append_response(from, response);
 }
 
@@ -113,16 +124,17 @@ TEST(EngineRead, ConfirmingAckAppliesBeforeTheReadIsReady) {
   become_leader(engine);
   ASSERT_EQ(engine.role(), Role::Leader) << engine.debug();
   EXPECT_EQ(engine.commit_index(), 0u);
-  // The lease clock started at election, but this term has not committed yet.
-  EXPECT_EQ(engine.lease_read().error(), Error::Rejected);
+  // Leadership stamps peer acks optimistically. A read lease ignores those
+  // stamps until a real AppendEntries ack arrives.
+  EXPECT_EQ(engine.lease_read().error(), Error::LeaseExpired);
 
   const ReadStart started = engine.begin_linearizable_read();
   ASSERT_TRUE(started.accepted);
   EXPECT_TRUE(engine.linearizable_read_pending(started.id));
-  const std::uint64_t seq = sent_seq(started.step);
-  EXPECT_GT(seq, 0u);
+  const SentHeartbeat sent = sent_heartbeat(started.step);
+  EXPECT_GT(sent.seq, 0u);
 
-  const StepResult confirmed = ack_seq(engine, 2, seq);
+  const StepResult confirmed = ack_seq(engine, 2, sent.seq, sent.sent_tick, 4);
   LogIndex index = 0;
   int apply_at = -1;
   int ready_at = -1;
@@ -144,19 +156,19 @@ TEST(EngineRead, ShortOfTheCommitQuorumDoesNotConfirm) {
 
   const ReadStart started = engine.begin_linearizable_read();
   ASSERT_TRUE(started.accepted);
-  const std::uint64_t seq = sent_seq(started.step);
-  EXPECT_GT(seq, 0u);
+  const SentHeartbeat sent = sent_heartbeat(started.step);
+  EXPECT_GT(sent.seq, 0u);
 
-  const StepResult one = ack_seq(engine, 2, seq);
+  const StepResult one = ack_seq(engine, 2, sent.seq, sent.sent_tick, 4);
   LogIndex ignored = 0;
   int apply_at = -1;
   int ready_at = -1;
   EXPECT_FALSE(command_ready(one, started.id, ignored, apply_at, ready_at));
   EXPECT_TRUE(engine.linearizable_read_pending(started.id));
   EXPECT_EQ(engine.commit_index(), 0u);
-  EXPECT_EQ(engine.lease_read().error(), Error::Rejected);
+  EXPECT_EQ(engine.lease_read().error(), Error::LeaseExpired);
 
-  const StepResult both = ack_seq(engine, 3, seq);
+  const StepResult both = ack_seq(engine, 3, sent.seq, sent.sent_tick, 4);
   LogIndex index = 0;
   ASSERT_TRUE(command_ready(both, started.id, index, apply_at, ready_at)) << engine.debug();
   EXPECT_GT(ready_at, apply_at);
@@ -227,6 +239,7 @@ class WatchMachine final : public RaftStateMachine {
   std::uint64_t watch{0};
   int polls_during_apply{0};
   bool served_before_apply{false};
+  LogIndex ready_index{0};
 
   Result<void> apply(const LogEntry& entry) override {
     if (entry.id.index > last_applied_) {
@@ -243,6 +256,8 @@ class WatchMachine final : public RaftStateMachine {
       const Result<LogIndex> polled = node->poll_linearizable_read(watch);
       if (polled.ok() && last_applied_ < polled.value()) {
         served_before_apply = true;
+      } else if (polled.ok()) {
+        ready_index = polled.value();
       }
     }
     return Result<void>::success();
@@ -342,10 +357,7 @@ TEST(LinearizableRead, DoesNotPublishBeforeApply) {
   machines.at(1)->watch = started.value();
   bus.hold_responses = false;
   bus.release();
-  bus.drain();
-  for (int tick = 0; tick < 8 &&
-                     nodes.at(1)->poll_linearizable_read(started.value()).error() == Error::Pending;
-       ++tick) {
+  for (int tick = 0; tick < 8; ++tick) {
     for (NodeId id : {1u, 2u, 3u}) {
       nodes.at(id)->tick();
     }
@@ -353,9 +365,10 @@ TEST(LinearizableRead, DoesNotPublishBeforeApply) {
   }
 
   const Result<LogIndex> ready = nodes.at(1)->poll_linearizable_read(started.value());
-  ASSERT_TRUE(ready.ok()) << ready.error();
-  EXPECT_GE(nodes.at(1)->last_applied(), ready.value());
-  EXPECT_GE(machines.at(1)->last_applied(), ready.value());
+  const LogIndex read_index = ready.ok() ? ready.value() : machines.at(1)->ready_index;
+  EXPECT_NE(read_index, 0u) << ready.error();
+  EXPECT_GE(nodes.at(1)->last_applied(), read_index);
+  EXPECT_GE(machines.at(1)->last_applied(), read_index);
   const std::vector<std::string>& rows = machines.at(1)->data();
   EXPECT_NE(std::find(rows.begin(), rows.end(), "seen"), rows.end());
   EXPECT_GT(machines.at(1)->polls_during_apply, 0);
@@ -593,6 +606,150 @@ TEST(ReadAfterSnapshot, RestartStillServesTheCompactedPrefix) {
   const Result<LogIndex> leased_again = cluster.node(leader).lease_read();
   ASSERT_TRUE(leased_again.ok()) << leased_again.error() << "\n" << cluster.debug();
   EXPECT_GE(cluster.machine(leader).last_applied(), leased_again.value());
+}
+
+TEST(EngineRead, ReadLeaseFollowsVoterTimeoutFromTheSendTick) {
+  Config config = pinned(20);
+  Engine engine(1, config);
+  engine.recover(Membership{{1, 2, 3}}, Vote{}, {});
+  become_leader(engine);
+  ASSERT_EQ(engine.role(), Role::Leader) << engine.debug();
+
+  const ReadStart started = engine.begin_linearizable_read();
+  ASSERT_TRUE(started.accepted);
+  const SentHeartbeat sent = sent_heartbeat(started.step);
+  ack_seq(engine, 2, sent.seq, sent.sent_tick, /*voter_min=*/8);
+  ASSERT_TRUE(engine.lease_read().ok()) << engine.lease_read().error();
+
+  for (int tick = 0; tick < 7; ++tick) {
+    engine.on_tick();
+  }
+  ASSERT_TRUE(engine.lease_read().ok()) << engine.lease_read().error();
+  engine.on_tick();
+  EXPECT_EQ(engine.lease_read().error(), Error::LeaseExpired);
+
+  ack_seq(engine, 2, sent.seq, sent.sent_tick, 8);
+  EXPECT_EQ(engine.lease_read().error(), Error::LeaseExpired) << engine.debug();
+
+  const StepResult heartbeat = engine.on_tick();
+  const SentHeartbeat fresh = sent_heartbeat(heartbeat);
+  EXPECT_GT(fresh.sent_tick, sent.sent_tick);
+  ack_seq(engine, 2, fresh.seq, fresh.sent_tick, 8);
+  ASSERT_TRUE(engine.lease_read().ok()) << engine.lease_read().error();
+}
+
+class CallbackMachine final : public RaftStateMachine {
+ public:
+  RaftNode* node{nullptr};
+  Error lease_during{Error::Ok};
+  Error poll_during{Error::Ok};
+  std::uint64_t read_during{0};
+  bool saw{false};
+
+  Result<void> apply(const LogEntry& entry) override {
+    if (entry.kind == EntryKind::Application && node != nullptr) {
+      saw = true;
+      lease_during = node->lease_read().error();
+      const Result<std::uint64_t> started = node->linearizable_read();
+      if (started.ok()) {
+        read_during = started.value();
+        poll_during = node->poll_linearizable_read(read_during).error();
+      } else {
+        poll_during = started.error();
+      }
+    }
+    if (entry.id.index == last_ + 1) {
+      last_ = entry.id.index;
+    }
+    return Result<void>::success();
+  }
+
+  LogIndex last_applied() const override { return last_; }
+  Result<std::string> build_snapshot() override { return Result<std::string>::success({}); }
+  Result<void> install_snapshot(const SnapshotMeta& meta, std::string_view) override {
+    if (meta.last_included.index < last_) {
+      return Result<void>::failure(Error::Rejected);
+    }
+    last_ = meta.last_included.index;
+    return Result<void>::success();
+  }
+
+ private:
+  LogIndex last_{0};
+};
+
+TEST(LinearizableRead, ApplyCallbackDoesNotObserveAnUnappliedIndex) {
+  auto storage = std::make_shared<MemoryLogStorage>();
+  auto machine = std::make_shared<CallbackMachine>();
+  RaftNode node(1, pinned(2), storage, machine, nullptr);
+  machine->node = &node;
+  ASSERT_TRUE(node.initialize(Membership{{1}}).ok());
+  node.tick();
+  node.tick();
+  ASSERT_EQ(node.role(), Role::Leader);
+
+  const Result<LogIndex> written = node.write("nested");
+  ASSERT_TRUE(written.ok()) << written.error();
+  EXPECT_TRUE(machine->saw);
+  EXPECT_EQ(machine->lease_during, Error::Rejected);
+  EXPECT_NE(machine->read_during, 0u);
+  EXPECT_EQ(machine->poll_during, Error::Pending);
+
+  const Result<LogIndex> ready = node.poll_linearizable_read(machine->read_during);
+  ASSERT_TRUE(ready.ok()) << ready.error();
+  EXPECT_GE(ready.value(), written.value());
+  EXPECT_GE(machine->last_applied(), ready.value());
+  EXPECT_EQ(node.poll_linearizable_read(machine->read_during).error(), Error::Rejected);
+  const Result<LogIndex> leased = node.lease_read();
+  ASSERT_TRUE(leased.ok()) << leased.error();
+  EXPECT_GE(machine->last_applied(), leased.value());
+}
+
+TEST(LinearizableRead, CancelAndCapReclaimInFlightReads) {
+  LoopBus bus;
+  bus.hold_responses = true;
+  std::map<NodeId, std::shared_ptr<MemoryLogStorage>> stores;
+  std::map<NodeId, std::shared_ptr<MemoryStateMachine>> machines;
+  std::map<NodeId, std::unique_ptr<RaftNode>> nodes;
+  for (NodeId id : {1u, 2u, 3u}) {
+    Config config = pinned(4 + static_cast<int>(id - 1) * 4);
+    config.max_in_flight_reads = 1;
+    stores.emplace(id, std::make_shared<MemoryLogStorage>());
+    machines.emplace(id, std::make_shared<MemoryStateMachine>());
+    nodes.emplace(id, std::make_unique<RaftNode>(id, config, stores.at(id), machines.at(id), &bus));
+    bus.nodes.emplace(id, nodes.at(id).get());
+    ASSERT_TRUE(nodes.at(id)->initialize(Membership{{1, 2, 3}}).ok());
+  }
+  bool elected = false;
+  for (int tick = 0; tick < 20 && !elected; ++tick) {
+    for (NodeId id : {1u, 2u, 3u}) {
+      nodes.at(id)->tick();
+    }
+    bus.drain();
+    elected = nodes.at(1)->role() == Role::Leader;
+  }
+  ASSERT_TRUE(elected);
+
+  const Result<std::uint64_t> first = nodes.at(1)->linearizable_read();
+  ASSERT_TRUE(first.ok()) << first.error();
+  EXPECT_EQ(nodes.at(1)->linearizable_read().error(), Error::Rejected);
+  ASSERT_TRUE(nodes.at(1)->cancel_read(first.value()).ok());
+  EXPECT_EQ(nodes.at(1)->poll_linearizable_read(first.value()).error(), Error::Rejected);
+  EXPECT_EQ(nodes.at(1)->cancel_read(first.value()).error(), Error::Rejected);
+
+  const Result<std::uint64_t> third = nodes.at(1)->linearizable_read();
+  ASSERT_TRUE(third.ok()) << third.error();
+  bus.hold_responses = false;
+  bus.release();
+  for (int tick = 0; tick < 8; ++tick) {
+    for (NodeId id : {1u, 2u, 3u}) {
+      nodes.at(id)->tick();
+    }
+    bus.drain();
+  }
+  const Result<LogIndex> ready = nodes.at(1)->poll_linearizable_read(third.value());
+  ASSERT_TRUE(ready.ok()) << ready.error();
+  EXPECT_EQ(nodes.at(1)->poll_linearizable_read(third.value()).error(), Error::Rejected);
 }
 
 }  // namespace

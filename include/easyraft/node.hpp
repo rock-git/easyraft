@@ -61,18 +61,23 @@ class RaftNode {
   // an entry, confirms leadership with a commit quorum of AppendEntries acks,
   // and returns an id. Followers and learners return `NotLeader`. This node
   // does not forward the read to the leader. Poll the id until it is ready.
-  // The state machine has applied at least the index `poll_linearizable_read`
-  // returns. `Error::Pending` means the confirmation or the apply has not
-  // finished. `NotLeader` means leadership was lost before the read was served.
-  // `Rejected` means the id was never started on this node.
+  // A successful poll consumes the id. `Error::Pending` means the confirmation
+  // or the state-machine apply has not finished, and does not consume the id.
+  // `NotLeader` means leadership was lost before the read was served; that
+  // poll also consumes the id. `Rejected` means the id is unknown, or
+  // `max_in_flight_reads` is already full.
   Result<std::uint64_t> linearizable_read();
   Result<LogIndex> poll_linearizable_read(std::uint64_t id);
-  // Leader only, while the existing leader lease is valid. Returns the
-  // applied commit index without a new quorum round. `LeaseExpired` means
-  // the lease does not cover the read: no state is returned, and the call
-  // does not fall back to `linearizable_read`. `Rejected` means the lease is
-  // valid but this term's commit is not applied yet. Followers and learners
-  // return `NotLeader`.
+  // Drops a pending, ready, or aborted read so the id can be reused in the
+  // in-flight budget. `Rejected` when the id is unknown.
+  Result<void> cancel_read(std::uint64_t id);
+  // Leader only. Returns the applied commit index without a new quorum round,
+  // and only when the state machine's own cursor already covers that index.
+  // The read lease is the vote-rejection lease narrowed to real acks, measured
+  // from the request's send tick and capped by each voter's `election_timeout_min`.
+  // `LeaseExpired` returns no index and does not fall back to `linearizable_read`.
+  // `Rejected` means the lease is valid but this term's commit is not applied
+  // yet. Followers and learners return `NotLeader`.
   Result<LogIndex> lease_read();
   void tick();
 
@@ -100,7 +105,9 @@ class RaftNode {
  private:
   void restore_if_present();
   void apply(const StepResult& step);
-  void publish_reads(const std::vector<Command>& reads);
+  void flush_reads();
+  void publish_read(const Command& command);
+  std::size_t tracked_reads() const;
   Result<LogIndex> finish_membership(ProposeResult proposed);
   void send(NodeId to, Payload payload);
   void dispatch(const Envelope& message);
@@ -116,6 +123,10 @@ class RaftNode {
   std::set<std::uint64_t> outstanding_reads_;
   std::map<std::uint64_t, LogIndex> ready_reads_;
   std::set<std::uint64_t> aborted_reads_;
+  // Held until the outermost apply finishes and the state machine cursor
+  // covers a ready index. Nested reads started from an apply callback stay here.
+  std::vector<Command> deferred_reads_;
+  int apply_depth_{0};
 };
 
 }  // namespace easyraft

@@ -31,6 +31,9 @@ struct AppendEntriesRequest {
   // Bumped when a leader starts a linearizable-read confirmation. A response
   // echoes it so an ack that left before that round cannot confirm the read.
   std::uint64_t heartbeat_seq{0};
+  // Leader tick when this request was built. A response echoes it so a delayed
+  // ack renews a read lease from the send tick, not from the arrival tick.
+  std::uint64_t sent_tick{0};
 };
 
 struct AppendEntriesResponse {
@@ -42,6 +45,12 @@ struct AppendEntriesResponse {
   LogIndex match_index{0};
   // Copied from the request. Zero when the sender did not set a round.
   std::uint64_t heartbeat_seq{0};
+  // Copied from the request. The leader's read lease expires from this tick.
+  std::uint64_t sent_tick{0};
+  // Responder's `election_timeout_min`, in ticks. Zero does not count as a
+  // read-lease acknowledgement. The leader never trusts a longer interval
+  // than its own minimum.
+  std::uint64_t voter_timeout_min{0};
   // Index the leader was trying to send (prev.index + 1, or 1).
   LogIndex probed_next{1};
   // Next index the leader should try after a conflict.
@@ -59,6 +68,9 @@ struct InstallSnapshotRequest {
   std::uint64_t offset{0};
   std::string data;
   bool done{false};
+  // Leader tick when this chunk was built. Echoed so a delayed install ack
+  // cannot extend a read lease up to the arrival tick.
+  std::uint64_t sent_tick{0};
 };
 
 struct InstallSnapshotResponse {
@@ -77,6 +89,10 @@ struct InstallSnapshotResponse {
   // Snapshot id from the request. A leader ignores progress updates for any
   // other id, so a delayed chunk cannot move a newer transfer.
   std::string snapshot_id;
+  // Copied from the request.
+  std::uint64_t sent_tick{0};
+  // Responder's `election_timeout_min`, in ticks. Zero is not read-lease evidence.
+  std::uint64_t voter_timeout_min{0};
 };
 
 // Distinct wrappers so PreVote cannot be confused with a real RequestVote.
