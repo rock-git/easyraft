@@ -145,6 +145,40 @@ TEST(Membership, LearnerEncodingRoundTripsAndKeepsVersionOne) {
   EXPECT_FALSE(Membership::decode(demoted.encode().substr(0, 4)).has_value());
 }
 
+TEST(Membership, VersionTwoDecodeCollapsesDuplicateVoters) {
+  auto append_u32 = [](std::string& out, std::uint32_t value) {
+    for (int shift = 0; shift < 32; shift += 8) {
+      out.push_back(static_cast<char>((value >> shift) & 0xffu));
+    }
+  };
+  auto append_u64 = [](std::string& out, std::uint64_t value) {
+    for (int shift = 0; shift < 64; shift += 8) {
+      out.push_back(static_cast<char>((value >> shift) & 0xffu));
+    }
+  };
+  // Version 2, one config, voters {1, 1, 2}, learner {3}, no extra sections.
+  std::string bytes;
+  bytes.push_back(2);
+  bytes.push_back(1);
+  append_u32(bytes, 3);
+  append_u64(bytes, 1);
+  append_u64(bytes, 1);
+  append_u64(bytes, 2);
+  append_u32(bytes, 1);
+  append_u64(bytes, 3);
+  bytes.push_back(0);
+
+  const auto decoded = Membership::decode(bytes);
+  ASSERT_TRUE(decoded.has_value());
+  EXPECT_EQ(decoded->configs()[0], (std::vector<NodeId>{1, 2}));
+  EXPECT_EQ(decoded->voters(), (std::vector<NodeId>{1, 2}));
+  EXPECT_EQ(decoded->learners(), (std::vector<NodeId>{3}));
+  EXPECT_EQ(decoded->quorum(), 2u);
+  EXPECT_FALSE(decoded->is_quorum([](NodeId id) { return id == 1; }));
+  EXPECT_TRUE(decoded->is_quorum([](NodeId id) { return id == 1 || id == 2; }));
+  EXPECT_EQ(*decoded, (Membership{{1, 2}, {3}}));
+}
+
 TEST(Membership, MemoryStorageAcceptsJointMembership) {
   MemoryLogStorage storage;
   const Membership joint = Membership::joint_of({1, 2, 3}, {2, 3, 4});

@@ -418,7 +418,10 @@ inline std::optional<Membership> Membership::decode(std::string_view bytes) {
     if (!read_ids(voters)) {
       return std::nullopt;
     }
-    configs.push_back(std::move(voters));
+    // Version 1 builds a Membership, which sorts and de-duplicates. Version 2
+    // assigns the configs directly, so do the same here. A repeated id would
+    // otherwise be counted twice by is_quorum and quorum_match_index.
+    configs.push_back(normalize(std::move(voters)));
   }
   if (version == 1) {
     if (offset != bytes.size()) {
