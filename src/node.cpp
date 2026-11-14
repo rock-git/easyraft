@@ -247,6 +247,55 @@ Result<LogIndex> RaftNode::demote_voter(NodeId voter) {
   return finish_membership(engine_.demote_voter(voter));
 }
 
+Result<std::uint64_t> RaftNode::linearizable_read() {
+  if (failed_) {
+    return Result<std::uint64_t>::failure(Error::Storage);
+  }
+  if (!initialized_) {
+    return Result<std::uint64_t>::failure(Error::NotInitialized);
+  }
+  if (role() != Role::Leader) {
+    return Result<std::uint64_t>::failure(Error::NotLeader);
+  }
+  const ReadStart started = engine_.begin_linearizable_read();
+  if (!started.accepted) {
+    return Result<std::uint64_t>::failure(Error::NotLeader);
+  }
+  outstanding_reads_.insert(started.id);
+  try {
+    apply(started.step);
+  } catch (const std::runtime_error&) {
+    return Result<std::uint64_t>::failure(Error::Storage);
+  }
+  if (failed_) {
+    return Result<std::uint64_t>::failure(Error::Storage);
+  }
+  return Result<std::uint64_t>::success(started.id);
+}
+
+Result<LogIndex> RaftNode::poll_linearizable_read(std::uint64_t id) {
+  if (failed_) {
+    return Result<LogIndex>::failure(Error::Storage);
+  }
+  if (!initialized_) {
+    return Result<LogIndex>::failure(Error::NotInitialized);
+  }
+  const auto ready = ready_reads_.find(id);
+  if (ready != ready_reads_.end()) {
+    return Result<LogIndex>::success(ready->second);
+  }
+  if (aborted_reads_.find(id) != aborted_reads_.end()) {
+    return Result<LogIndex>::failure(Error::NotLeader);
+  }
+  if (outstanding_reads_.find(id) != outstanding_reads_.end()) {
+    return Result<LogIndex>::failure(Error::Pending);
+  }
+  if (role() != Role::Leader) {
+    return Result<LogIndex>::failure(Error::NotLeader);
+  }
+  return Result<LogIndex>::failure(Error::Rejected);
+}
+
 Result<void> RaftNode::trigger_snapshot() {
   if (failed_) {
     return Result<void>::failure(Error::Storage);
@@ -309,6 +358,9 @@ void RaftNode::apply(const StepResult& step) {
   if (failed_) {
     return;
   }
+  // Published after Apply commands in this step, so a read is not visible
+  // while the state machine is still catching up to its index.
+  std::vector<Command> reads;
   try {
     for (const Command& command : step.commands) {
       switch (command.kind) {
@@ -340,6 +392,10 @@ void RaftNode::apply(const StepResult& step) {
         case CommandKind::Purge:
           check(storage_->purge_through(command.index));
           break;
+        case CommandKind::ReadReady:
+        case CommandKind::ReadAborted:
+          reads.push_back(command);
+          break;
       }
     }
   } catch (const std::runtime_error&) {
@@ -348,8 +404,23 @@ void RaftNode::apply(const StepResult& step) {
     failed_ = true;
     throw;
   }
+  publish_reads(reads);
   for (const Outbound& message : step.outbound) {
     send(message.to, message.payload);
+  }
+}
+
+void RaftNode::publish_reads(const std::vector<Command>& reads) {
+  for (const Command& command : reads) {
+    if (command.kind == CommandKind::ReadReady) {
+      aborted_reads_.erase(command.read_id);
+      ready_reads_[command.read_id] = command.index;
+      outstanding_reads_.erase(command.read_id);
+    } else if (command.kind == CommandKind::ReadAborted) {
+      ready_reads_.erase(command.read_id);
+      outstanding_reads_.erase(command.read_id);
+      aborted_reads_.insert(command.read_id);
+    }
   }
 }
 

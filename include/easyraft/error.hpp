@@ -21,6 +21,9 @@ enum class Error {
   InvalidMembership,
   Storage,
   Rejected,
+  // A linearizable read has been accepted and is waiting for a commit quorum
+  // or for the state machine to apply its read index.
+  Pending,
 };
 
 inline const char* to_string(Error error) {
@@ -39,6 +42,8 @@ inline const char* to_string(Error error) {
       return "storage";
     case Error::Rejected:
       return "rejected";
+    case Error::Pending:
+      return "pending";
   }
   return "unknown";
 }
