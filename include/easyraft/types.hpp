@@ -643,10 +643,16 @@ inline std::optional<Membership> Membership::decode(std::string_view bytes) {
     if (offset != bytes.size()) {
       return std::nullopt;
     }
+    std::optional<Membership> built;
     if (configs.size() == 1) {
-      return Membership{std::move(configs[0])};
+      built = Membership{std::move(configs[0])};
+    } else {
+      built = joint_of(std::move(configs[0]), std::move(configs[1]));
     }
-    return joint_of(std::move(configs[0]), std::move(configs[1]));
+    if (!built->quorums_intersect()) {
+      return std::nullopt;
+    }
+    return built;
   }
 
   std::vector<NodeId> learners;
@@ -706,12 +712,14 @@ inline std::optional<Membership> Membership::decode(std::string_view bytes) {
   membership.configs_ = std::move(configs);
   membership.rebuild_voters();
   membership.learners_ = normalize(std::move(learners));
-  membership.quorums_.assign(membership.configs_.size(), Quorum{});
-  if (has_quorums) {
-    for (std::size_t index = 0; index < membership.configs_.size(); ++index) {
-      membership.quorums_[index] =
-          store_quorum(membership.configs_[index].size(), decoded_quorums[index]);
+  membership.quorums_.reserve(membership.configs_.size());
+  for (std::size_t index = 0; index < membership.configs_.size(); ++index) {
+    const Quorum requested = has_quorums ? decoded_quorums[index] : Quorum{};
+    const std::optional<Quorum> quorum = normalize_quorum(membership.configs_[index].size(), requested);
+    if (!quorum) {
+      return std::nullopt;
     }
+    membership.quorums_.push_back(*quorum);
   }
   if (has_uniform) {
     std::vector<NodeId> after = normalize(std::move(uniform_learners));
@@ -724,10 +732,19 @@ inline std::optional<Membership> Membership::decode(std::string_view bytes) {
     membership.prior_learners_ = normalize(std::move(prior));
   }
   if (has_prior_quorum) {
+    if (membership.configs_.empty()) {
+      return std::nullopt;
+    }
+    const std::optional<Quorum> restored =
+        normalize_quorum(membership.configs_.front().size(), prior_quorum);
+    if (!restored) {
+      return std::nullopt;
+    }
     membership.has_prior_quorum_ = true;
-    const std::size_t prior_voters =
-        membership.configs_.empty() ? 0 : membership.configs_.front().size();
-    membership.prior_quorum_ = store_quorum(prior_voters, prior_quorum);
+    membership.prior_quorum_ = *restored;
+  }
+  if (!membership.quorums_intersect()) {
+    return std::nullopt;
   }
   return membership;
 }
