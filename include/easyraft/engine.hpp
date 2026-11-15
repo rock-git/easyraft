@@ -86,6 +86,13 @@ struct SnapshotBuild {
   bool started{false};
 };
 
+// A leadership transfer accepted by the leader. `step` may already contain
+// AppendEntries for the target and, when that voter is caught up, TimeoutNow.
+struct TransferStart {
+  StepResult step;
+  bool accepted{false};
+};
+
 // A linearizable read accepted by the leader. Heartbeats, when a peer quorum
 // is required, are in `step.outbound`. `id` is polled until ReadReady.
 struct ReadStart {
@@ -165,6 +172,22 @@ class Engine {
   // state and does not start a quorum round. `Rejected` means the lease is
   // valid but this term has not yet committed an entry through `last_applied`.
   Result<LogIndex> lease_read() const;
+  // Leader only. `target` must be a different current voter that can win an
+  // election: every voter granting is an election quorum of every config,
+  // including a joint config and a non-default threshold. Learners cannot.
+  // The leader then rejects new proposals and new read rounds, replicates
+  // until `target` matches the log, and sends TimeoutNow. `accepted` is false
+  // when this node cannot start one. Poll `poll_transfer` for the outcome.
+  // Catch-up is bounded by `election_timeout_min` ticks. The election after
+  // TimeoutNow gets another `election_timeout_min` ticks. Neither bound
+  // changes heartbeat or election intervals.
+  TransferStart begin_transfer(NodeId target);
+  // `Pending` while the transfer runs. Success means `target` became the
+  // committed leader. `TransferFailed` means the deadline passed or another
+  // node became leader. `Rejected` means this node has no transfer to report.
+  // A finished result stays until the next `begin_transfer`.
+  Result<void> poll_transfer() const;
+  bool leader_transfer_active() const;
 
   VoteStep on_pre_vote(const VoteRequest& request);
   StepResult on_pre_vote_response(NodeId from, const PreVoteResponse& response);
@@ -174,6 +197,7 @@ class Engine {
   StepResult on_append_response(NodeId from, const AppendEntriesResponse& response);
   InstallStep on_install(const InstallSnapshotRequest& request);
   StepResult on_install_response(NodeId from, const InstallSnapshotResponse& response);
+  StepResult on_timeout_now(const TimeoutNow& request);
 
   bool initialized() const { return initialized_; }
   const Membership& membership() const { return membership_; }
@@ -220,6 +244,18 @@ class Engine {
     Vote vote{};
     std::set<NodeId> grants;
     std::uint64_t probe{0};
+  };
+
+  // In-flight leadership handoff. `authorizing` is the committed vote that
+  // TimeoutNow and RequestVote present. `deadline` is the catch-up bound
+  // until TimeoutNow is sent, then the election bound.
+  struct Transfer {
+    enum class Status { Running, Succeeded, Failed };
+    NodeId target{0};
+    Vote authorizing{};
+    std::uint64_t deadline{0};
+    bool timeout_sent{false};
+    Status status{Status::Running};
   };
 
   // One client linearizable read. `read_index` stays empty until this leader
@@ -272,9 +308,17 @@ class Engine {
   void replicate_all(StepResult& out);
   void send_append(StepResult& out, NodeId to);
   void send_snapshot(StepResult& out, NodeId to);
-  void send_vote_requests(StepResult& out, bool pre_vote, const Vote& vote);
+  void send_vote_requests(StepResult& out,
+                          bool pre_vote,
+                          const Vote& vote,
+                          std::optional<Vote> transfer_from = std::nullopt);
   void pre_elect(StepResult& out);
-  void elect(StepResult& out);
+  void elect(StepResult& out, std::optional<Vote> transfer_from = std::nullopt);
+  bool electable_target(NodeId target) const;
+  bool transfer_target_caught_up(NodeId target) const;
+  void drive_transfer(StepResult& out);
+  void observe_transfer();
+  void send_timeout_now(StepResult& out);
   void establish_leader(StepResult& out);
   void enqueue_applies(StepResult& out);
 
@@ -314,6 +358,7 @@ class Engine {
   std::map<NodeId, Progress> progress_;
   std::vector<PendingRead> reads_;
   std::uint64_t next_read_id_{1};
+  std::optional<Transfer> transfer_;
 };
 
 }  // namespace easyraft

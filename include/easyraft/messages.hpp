@@ -118,6 +118,15 @@ struct RequestVoteResponse {
   VoteResponse body{};
 };
 
+// The leader has caught `last_log_id` up on the target and wants that voter
+// to campaign immediately. Not a heartbeat. A follower campaigns only when
+// `leader` is the committed vote it already follows and its log is at least
+// `last_log_id`. Learners ignore it.
+struct TimeoutNow {
+  Vote leader{};
+  std::optional<LogId> last_log_id{};
+};
+
 using Payload = std::variant<PreVoteRequest,
                              PreVoteResponse,
                              RequestVote,
@@ -125,7 +134,8 @@ using Payload = std::variant<PreVoteRequest,
                              AppendEntriesRequest,
                              AppendEntriesResponse,
                              InstallSnapshotRequest,
-                             InstallSnapshotResponse>;
+                             InstallSnapshotResponse,
+                             TimeoutNow>;
 
 struct Envelope {
   NodeId from{0};
