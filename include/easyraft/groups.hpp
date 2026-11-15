@@ -35,11 +35,15 @@ class RaftGroups {
   RaftGroups& operator=(RaftGroups&&) = default;
 
   // Inserts a group. The storage and the state machine must be non-null and
-  // not already used by another group on this host. The node restores from
-  // storage the way `RaftNode` does; a new group still needs `initialize`.
-  // `AlreadyInitialized` means this group id is already present. `Rejected`
-  // means the arguments are missing or shared with another group. `Storage`
-  // means opening the node failed while reading its log.
+  // not already used by another group on this host. The id and those two
+  // pointers are reserved before the node is built. Recovery runs inside the
+  // constructor and can call back into `add` from the state machine, and the
+  // reservation is visible to that callback. `find` stays empty for this id
+  // until `add` returns. A failed open removes the reservation.
+  // `AlreadyInitialized` means this group id is already present, including a
+  // group whose node is still opening. `Rejected` means the arguments are
+  // missing or shared with another group. `Storage` means opening the node
+  // failed while reading its log.
   Result<void> add(GroupId group,
                    Config config,
                    std::shared_ptr<RaftLogStorage> storage,
@@ -82,27 +86,41 @@ inline Result<void> RaftGroups::add(GroupId group,
       return Result<void>::failure(Error::Rejected);
     }
   }
+  // Reserve before RaftNode::RaftNode. restore_if_present can invoke the state
+  // machine, and that callback can call add again. Inserting first makes the
+  // same id and the same resources visible, and a failed emplace is not reported
+  // as success.
+  auto [it, inserted] = slots_.emplace(group, Slot{nullptr, storage, state_machine});
+  if (!inserted) {
+    return Result<void>::failure(Error::AlreadyInitialized);
+  }
   try {
-    Slot slot;
-    slot.storage = storage;
-    slot.state_machine = state_machine;
-    slot.node = std::make_unique<RaftNode>(id_, std::move(config), std::move(storage),
-                                           std::move(state_machine), bus_, group);
-    slots_.emplace(group, std::move(slot));
+    it->second.node = std::make_unique<RaftNode>(id_, std::move(config), it->second.storage,
+                                                 it->second.state_machine, bus_, group);
   } catch (const std::runtime_error&) {
+    slots_.erase(it);
     return Result<void>::failure(Error::Storage);
+  } catch (...) {
+    slots_.erase(it);
+    throw;
   }
   return Result<void>::success();
 }
 
 inline RaftNode* RaftGroups::find(GroupId group) {
   const auto it = slots_.find(group);
-  return it == slots_.end() ? nullptr : it->second.node.get();
+  if (it == slots_.end() || !it->second.node) {
+    return nullptr;
+  }
+  return it->second.node.get();
 }
 
 inline const RaftNode* RaftGroups::find(GroupId group) const {
   const auto it = slots_.find(group);
-  return it == slots_.end() ? nullptr : it->second.node.get();
+  if (it == slots_.end() || !it->second.node) {
+    return nullptr;
+  }
+  return it->second.node.get();
 }
 
 inline void RaftGroups::tick() {
@@ -111,7 +129,10 @@ inline void RaftGroups::tick() {
   std::vector<RaftNode*> nodes;
   nodes.reserve(slots_.size());
   for (auto& [_, slot] : slots_) {
-    nodes.push_back(slot.node.get());
+    // A group reserved by an add that has not returned has no node yet.
+    if (slot.node) {
+      nodes.push_back(slot.node.get());
+    }
   }
   for (RaftNode* node : nodes) {
     node->tick();
@@ -123,7 +144,7 @@ inline void RaftGroups::on_message(const Envelope& message) {
     return;
   }
   const auto it = slots_.find(message.group);
-  if (it == slots_.end()) {
+  if (it == slots_.end() || !it->second.node) {
     return;
   }
   it->second.node->on_message(message);
@@ -132,8 +153,10 @@ inline void RaftGroups::on_message(const Envelope& message) {
 inline std::vector<GroupId> RaftGroups::groups() const {
   std::vector<GroupId> ids;
   ids.reserve(slots_.size());
-  for (const auto& [id, _] : slots_) {
-    ids.push_back(id);
+  for (const auto& [id, slot] : slots_) {
+    if (slot.node) {
+      ids.push_back(id);
+    }
   }
   return ids;
 }
