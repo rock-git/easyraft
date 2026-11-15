@@ -15,6 +15,11 @@ namespace easyraft {
 struct VoteRequest {
   Vote vote{};
   std::optional<LogId> last_log_id{};
+  // Set only for an election started by TimeoutNow. A voter whose committed
+  // vote equals this grants the request even while its leader lease is still
+  // valid. Any other value leaves the lease check unchanged. PreVote does not
+  // use the field.
+  std::optional<Vote> leadership_transfer_from{};
 };
 
 struct VoteResponse {
