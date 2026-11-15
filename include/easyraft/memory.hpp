@@ -9,14 +9,19 @@
 #include <algorithm>
 #include <cstdint>
 #include <limits>
+#include <map>
+#include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 namespace easyraft {
 
 // In-memory log used by tests and as a reference storage implementation.
+// One instance is one group's log. `MemoryGroupStore` keeps a separate
+// instance per group.
 class MemoryLogStorage final : public RaftLogStorage {
  public:
   Result<void> save_vote(const Vote& vote) override {
@@ -161,6 +166,44 @@ class MemoryLogStorage final : public RaftLogStorage {
   std::optional<Snapshot> snapshot_;
   LogIndex compacted_through_{0};
   std::vector<LogEntry> log_;
+};
+
+// In-memory logs for more than one Raft group. `open` creates a group's log
+// on first use and returns that same log after. Two groups never share the
+// vector of records.
+class MemoryGroupStore {
+ public:
+  std::shared_ptr<MemoryLogStorage> open(GroupId group) {
+    const auto [it, inserted] = stores_.emplace(group, nullptr);
+    if (inserted) {
+      it->second = std::make_shared<MemoryLogStorage>();
+    }
+    return it->second;
+  }
+
+  MemoryLogStorage* find(GroupId group) {
+    const auto it = stores_.find(group);
+    return it == stores_.end() ? nullptr : it->second.get();
+  }
+
+  const MemoryLogStorage* find(GroupId group) const {
+    const auto it = stores_.find(group);
+    return it == stores_.end() ? nullptr : it->second.get();
+  }
+
+  bool contains(GroupId group) const { return stores_.contains(group); }
+
+  std::vector<GroupId> groups() const {
+    std::vector<GroupId> ids;
+    ids.reserve(stores_.size());
+    for (const auto& [id, _] : stores_) {
+      ids.push_back(id);
+    }
+    return ids;
+  }
+
+ private:
+  std::map<GroupId, std::shared_ptr<MemoryLogStorage>> stores_;
 };
 
 // Records committed application payloads. Blank and membership entries advance

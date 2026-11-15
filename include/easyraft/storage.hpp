@@ -17,7 +17,12 @@ namespace easyraft {
 // delete a prefix that peers are unable to install.
 inline constexpr std::uint64_t kMaxSnapshotDataBytes = 64ull << 20;
 
-// Persistent Raft log and hard state.
+// Persistent Raft log and hard state for one Raft group.
+//
+// One instance is one group's vote, membership, log, and snapshot. A second
+// group needs its own instance. `FileLogStorage::open_group` puts each group
+// in its own directory, and `MemoryGroupStore` holds one `MemoryLogStorage`
+// per group. Records from two groups never share a log file.
 //
 // Persists the vote, the membership (voter configs, their quorums, and
 // learners), the log, and at most one snapshot of applied state. A default
