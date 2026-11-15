@@ -688,6 +688,119 @@ TEST(FileLogStorage, CorruptVoteDoesNotDropTheLog) {
   EXPECT_EQ(kept.value()[0].data, "kept");
 }
 
+Snapshot group_image(LogId id, Membership membership, std::string data) {
+  Snapshot snapshot;
+  snapshot.meta.last_included = id;
+  snapshot.meta.membership = std::move(membership);
+  snapshot.meta.snapshot_id = snapshot_id_from(id);
+  snapshot.data = std::move(data);
+  return snapshot;
+}
+
+TEST(FileLogStorage, GroupsKeepSeparateLogsVotesAndSnapshots) {
+  TempDir dir;
+  const std::filesystem::path root = dir.path();
+  EXPECT_NE(FileLogStorage::group_directory(root, 1), FileLogStorage::group_directory(root, 2));
+
+  const Snapshot snap1 = group_image(LogId{1, 1, 1}, Membership{{1, 2}}, "snap-group-1");
+  const Snapshot snap2 = group_image(LogId{2, 3, 1}, Membership{{1, 2, 3}}, "snap-group-2");
+  Vote vote1;
+  vote1.leader = LeaderId{4, 1};
+  vote1.committed = true;
+  Vote vote2;
+  vote2.leader = LeaderId{7, 3};
+  vote2.committed = true;
+
+  {
+    const std::shared_ptr<FileLogStorage> first = FileLogStorage::open_group(root, 1);
+    const std::shared_ptr<FileLogStorage> second = FileLogStorage::open_group(root, 2);
+    ASSERT_TRUE(first->save_vote(vote1).ok());
+    ASSERT_TRUE(second->save_vote(vote2).ok());
+    ASSERT_TRUE(first->save_membership(Membership{{1, 2}}).ok());
+    ASSERT_TRUE(second->save_membership(Membership{{1, 2, 3}}).ok());
+    ASSERT_TRUE(first->append({app(1, "group-one-payload"), app(2, "group-one-more")}).ok());
+    ASSERT_TRUE(second->append({app(1, "group-two-payload")}).ok());
+    ASSERT_TRUE(first->save_snapshot(snap1).ok());
+    ASSERT_TRUE(first->purge_through(1).ok());
+    ASSERT_TRUE(second->save_snapshot(snap2).ok());
+
+    EXPECT_FALSE(std::filesystem::exists(root / "log"));
+    EXPECT_FALSE(std::filesystem::exists(root / "vote"));
+    EXPECT_FALSE(std::filesystem::exists(root / "snapshot"));
+    EXPECT_TRUE(std::filesystem::is_regular_file(FileLogStorage::group_directory(root, 1) / "log"));
+    EXPECT_TRUE(std::filesystem::is_regular_file(FileLogStorage::group_directory(root, 2) / "log"));
+
+    const std::string log1 = read_bytes(FileLogStorage::group_directory(root, 1) / "log");
+    const std::string log2 = read_bytes(FileLogStorage::group_directory(root, 2) / "log");
+    EXPECT_NE(log1, log2);
+    EXPECT_EQ(log1.find("group-two-payload"), std::string::npos);
+    EXPECT_EQ(log2.find("group-one-payload"), std::string::npos);
+    EXPECT_EQ(log2.find("group-one-more"), std::string::npos);
+    const std::string image1 = read_bytes(FileLogStorage::group_directory(root, 1) / "snapshot");
+    const std::string image2 = read_bytes(FileLogStorage::group_directory(root, 2) / "snapshot");
+    EXPECT_NE(image1.find("snap-group-1"), std::string::npos);
+    EXPECT_EQ(image1.find("snap-group-2"), std::string::npos);
+    EXPECT_NE(image2.find("snap-group-2"), std::string::npos);
+    EXPECT_EQ(image2.find("snap-group-1"), std::string::npos);
+  }
+
+  {
+    const std::shared_ptr<FileLogStorage> first = FileLogStorage::open_group(root, 1);
+    const std::shared_ptr<FileLogStorage> second = FileLogStorage::open_group(root, 2);
+    const auto loaded1 = first->load_vote();
+    const auto loaded2 = second->load_vote();
+    ASSERT_TRUE(loaded1.ok());
+    ASSERT_TRUE(loaded2.ok());
+    ASSERT_TRUE(loaded1.value().has_value());
+    ASSERT_TRUE(loaded2.value().has_value());
+    EXPECT_EQ(*loaded1.value(), vote1);
+    EXPECT_EQ(*loaded2.value(), vote2);
+
+    const auto mem1 = first->load_membership();
+    const auto mem2 = second->load_membership();
+    ASSERT_TRUE(mem1.ok());
+    ASSERT_TRUE(mem2.ok());
+    ASSERT_TRUE(mem1.value().has_value());
+    ASSERT_TRUE(mem2.value().has_value());
+    EXPECT_EQ(mem1.value()->voters(), (std::vector<NodeId>{1, 2}));
+    EXPECT_EQ(mem2.value()->voters(), (std::vector<NodeId>{1, 2, 3}));
+
+    const auto entries1 = first->read(1, 10);
+    const auto entries2 = second->read(1, 10);
+    ASSERT_TRUE(entries1.ok());
+    ASSERT_TRUE(entries2.ok());
+    ASSERT_EQ(entries1.value().size(), 1u);
+    EXPECT_EQ(entries1.value().front().data, "group-one-more");
+    ASSERT_EQ(entries2.value().size(), 1u);
+    EXPECT_EQ(entries2.value().front().data, "group-two-payload");
+    EXPECT_FALSE(has_payload(entries1.value(), "group-two-payload"));
+    EXPECT_FALSE(has_payload(entries2.value(), "group-one-payload"));
+
+    const auto shots1 = first->load_snapshot();
+    const auto shots2 = second->load_snapshot();
+    ASSERT_TRUE(shots1.ok());
+    ASSERT_TRUE(shots2.ok());
+    ASSERT_TRUE(shots1.value().has_value());
+    ASSERT_TRUE(shots2.value().has_value());
+    EXPECT_EQ(shots1.value()->data, snap1.data);
+    EXPECT_EQ(shots2.value()->data, snap2.data);
+    EXPECT_EQ(shots1.value()->meta, snap1.meta);
+    EXPECT_EQ(shots2.value()->meta, snap2.meta);
+  }
+
+  {
+    FileLogStorage single(root);
+    ASSERT_TRUE(single.append({app(1, "single-group-payload")}).ok());
+  }
+  EXPECT_TRUE(std::filesystem::is_regular_file(root / "log"));
+  EXPECT_NE(read_bytes(root / "log").find("single-group-payload"), std::string::npos);
+  EXPECT_EQ(read_bytes(root / "log").find("group-one-more"), std::string::npos);
+  EXPECT_EQ(read_bytes(FileLogStorage::group_directory(root, 1) / "log").find("single-group-payload"),
+            std::string::npos);
+  EXPECT_EQ(read_bytes(FileLogStorage::group_directory(root, 2) / "log").find("single-group-payload"),
+            std::string::npos);
+}
+
 TEST(ClusterPersistence, FileRestartRecoversVoteAndLogAndDropsUncommitted) {
   test::Cluster cluster({1, 2, 3}, test::fast_config(4), true, test::StorageMode::File);
   ASSERT_TRUE(cluster.until([&] { return cluster.agreed_on(1); }, 20)) << cluster.debug();

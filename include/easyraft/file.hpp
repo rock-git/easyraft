@@ -7,6 +7,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
@@ -14,6 +15,12 @@
 namespace easyraft {
 
 // Durable RaftLogStorage rooted at one directory. Not thread-safe.
+//
+// A single-group caller passes that directory to the constructor. The files
+// below live directly in it. Several groups share a parent directory through
+// `open_group`: group `id` is stored at `root/groups/<id>/` and uses this
+// same layout. Two group ids never share a log file, and opening a group
+// does not write `vote`, `membership`, `log`, or `snapshot` into `root`.
 //
 // Layout:
 //   vote         current vote
@@ -63,6 +70,11 @@ class FileLogStorage final : public RaftLogStorage {
   explicit FileLogStorage(std::filesystem::path directory);
   ~FileLogStorage() override;
 
+  // `root/groups/<id>`, with `<id>` in decimal. The path is unique per id.
+  static std::filesystem::path group_directory(const std::filesystem::path& root, GroupId group);
+  // Creates that subdirectory and opens it as one group's storage.
+  static std::shared_ptr<FileLogStorage> open_group(std::filesystem::path root, GroupId group);
+
   FileLogStorage(const FileLogStorage&) = delete;
   FileLogStorage& operator=(const FileLogStorage&) = delete;
   FileLogStorage(FileLogStorage&&) = delete;
@@ -100,5 +112,15 @@ class FileLogStorage final : public RaftLogStorage {
   std::vector<std::uint64_t> offsets_;
   std::uint64_t end_offset_{0};
 };
+
+inline std::filesystem::path FileLogStorage::group_directory(const std::filesystem::path& root,
+                                                             GroupId group) {
+  return root / "groups" / std::to_string(group);
+}
+
+inline std::shared_ptr<FileLogStorage> FileLogStorage::open_group(std::filesystem::path root,
+                                                                  GroupId group) {
+  return std::make_shared<FileLogStorage>(group_directory(std::move(root), group));
+}
 
 }  // namespace easyraft
