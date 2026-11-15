@@ -229,6 +229,125 @@ TEST(RaftGroups, RoutesAMessageToItsGroupOnly) {
   EXPECT_EQ(bus.sent.size(), 2u);
 }
 
+Snapshot persisted_image() {
+  Snapshot snapshot;
+  snapshot.meta.last_included = LogId{1, 1, 1};
+  snapshot.meta.membership = Membership{{1}};
+  snapshot.meta.snapshot_id = snapshot_id_from(snapshot.meta.last_included);
+  snapshot.data.assign(4, '\0');
+  return snapshot;
+}
+
+class RecoveryCallbackMachine final : public RaftStateMachine {
+ public:
+  RaftGroups* host{nullptr};
+  std::shared_ptr<RaftLogStorage> storage;
+  std::weak_ptr<RaftStateMachine> self;
+  Error same_group{Error::Ok};
+  Error shared_storage{Error::Ok};
+  Error shared_machine{Error::Ok};
+  Error fresh{Error::Ok};
+  bool opening_was_hidden{false};
+  bool callback_ran{false};
+
+  Result<void> apply(const LogEntry& entry) override {
+    last_ = entry.id.index;
+    return Result<void>::success();
+  }
+
+  LogIndex last_applied() const override { return last_; }
+
+  Result<std::string> build_snapshot() override { return Result<std::string>::success(std::string(4, '\0')); }
+
+  Result<void> install_snapshot(const SnapshotMeta& meta, std::string_view) override {
+    if (callback_ran) {
+      last_ = meta.last_included.index;
+      return Result<void>::success();
+    }
+    callback_ran = true;
+    last_ = meta.last_included.index;
+    auto other_storage = std::make_shared<MemoryLogStorage>();
+    auto other_machine = std::make_shared<MemoryStateMachine>();
+    same_group = host->add(7, pinned(4), other_storage, other_machine).error();
+    shared_storage = host->add(8, pinned(4), storage, std::make_shared<MemoryStateMachine>()).error();
+    shared_machine =
+        host->add(9, pinned(4), std::make_shared<MemoryLogStorage>(), self.lock()).error();
+    fresh = host->add(11, pinned(4), std::make_shared<MemoryLogStorage>(),
+                      std::make_shared<MemoryStateMachine>())
+                 .error();
+    opening_was_hidden = host->find(7) == nullptr;
+    host->tick();
+    Envelope message;
+    message.to = host->id();
+    message.group = 7;
+    message.payload = RequestVote{};
+    host->on_message(message);
+    return Result<void>::success();
+  }
+
+ private:
+  LogIndex last_{0};
+};
+
+class FailingSnapshotMachine final : public RaftStateMachine {
+ public:
+  Result<void> apply(const LogEntry&) override { return Result<void>::success(); }
+  LogIndex last_applied() const override { return 0; }
+  Result<std::string> build_snapshot() override { return Result<std::string>::success(std::string{}); }
+  Result<void> install_snapshot(const SnapshotMeta&, std::string_view) override {
+    return Result<void>::failure(Error::Storage);
+  }
+};
+
+TEST(RaftGroups, ReservesTheGroupBeforeRecoveryCallbacks) {
+  auto storage = std::make_shared<MemoryLogStorage>();
+  ASSERT_TRUE(storage->save_membership(Membership{{1}}).ok());
+  ASSERT_TRUE(storage->save_snapshot(persisted_image()).ok());
+  auto machine = std::make_shared<RecoveryCallbackMachine>();
+  RaftGroups host(1, nullptr);
+  machine->host = &host;
+  machine->storage = storage;
+  machine->self = machine;
+
+  const Result<void> added = host.add(7, pinned(4), storage, machine);
+  ASSERT_TRUE(added.ok()) << added.error();
+  EXPECT_TRUE(machine->callback_ran);
+  EXPECT_EQ(machine->same_group, Error::AlreadyInitialized);
+  EXPECT_EQ(machine->shared_storage, Error::Rejected);
+  EXPECT_EQ(machine->shared_machine, Error::Rejected);
+  EXPECT_EQ(machine->fresh, Error::Ok);
+  EXPECT_TRUE(machine->opening_was_hidden);
+  ASSERT_NE(host.find(7), nullptr);
+  ASSERT_NE(host.find(11), nullptr);
+  EXPECT_EQ(host.find(7)->group(), 7u);
+  EXPECT_TRUE(host.find(7)->initialized());
+  EXPECT_GE(host.find(7)->last_log_index(), 1u);
+  EXPECT_EQ(host.find(11)->group(), 11u);
+  EXPECT_FALSE(host.find(11)->initialized());
+  EXPECT_EQ(host.find(11)->last_log_index(), 0u);
+  EXPECT_EQ(host.groups(), (std::vector<GroupId>{7, 11}));
+  EXPECT_EQ(host.find(8), nullptr);
+  EXPECT_EQ(host.find(9), nullptr);
+}
+
+TEST(RaftGroups, DropsTheReservationWhenRecoveryFails) {
+  auto storage = std::make_shared<MemoryLogStorage>();
+  ASSERT_TRUE(storage->save_membership(Membership{{1}}).ok());
+  ASSERT_TRUE(storage->save_snapshot(persisted_image()).ok());
+  RaftGroups host(1, nullptr);
+  const Result<void> failed = host.add(4, pinned(4), storage, std::make_shared<FailingSnapshotMachine>());
+  EXPECT_EQ(failed.error(), Error::Storage);
+  EXPECT_EQ(host.find(4), nullptr);
+  EXPECT_TRUE(host.groups().empty());
+
+  const Result<void> added = host.add(4, pinned(4), storage, std::make_shared<MemoryStateMachine>());
+  ASSERT_TRUE(added.ok()) << added.error();
+  ASSERT_NE(host.find(4), nullptr);
+  EXPECT_TRUE(host.find(4)->initialized());
+  EXPECT_EQ(host.find(4)->group(), 4u);
+  EXPECT_EQ(host.groups(), (std::vector<GroupId>{4}));
+}
+
 constexpr GroupId kAlpha = 10;
 constexpr GroupId kBeta = 20;
 const std::vector<NodeId> kNodes{1, 2, 3};
