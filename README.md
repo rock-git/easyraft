@@ -1,6 +1,6 @@
 # easyraft
 
-easyraft is a small C++20 implementation of the [Raft](https://raft.github.io/) consensus protocol. Phase 1 is the core algorithm: leader election, log replication, flexible quorums, joint-consensus membership changes, learners, log snapshots, linearizable and lease reads, leader transfer, and restart from a persisted vote, membership, log, and snapshot.
+easyraft is a small C++20 implementation of the [Raft](https://raft.github.io/) consensus protocol. Phase 1 is the core algorithm: leader election, log replication, flexible quorums, joint-consensus membership changes, learners, log snapshots, linearizable and lease reads, leader transfer, multiple independent Raft groups, and restart from a persisted vote, membership, log, and snapshot.
 
 The design follows the OpenRaft 0.10 line (`release-0.10`, published as 0.10.0): a pure, tick-driven engine decides, and a thin runtime performs storage and network I/O. This is an independent implementation inspired by that design. It is not an official OpenRaft port and it does not contain OpenRaft source code. OpenRaft is a Databend project and is derived from the original async-raft work. See `NOTICE`.
 
@@ -18,14 +18,17 @@ Included:
 - Snapshots of applied state, crash-safe log compaction, and `InstallSnapshot` catch-up for a lagging voter, a new voter, or a learner
 - Linearizable reads (a ReadIndex round on the leader) and lease reads that reuse the leader's existing lease
 - Leader transfer: the leader catches up one voter, then that voter campaigns immediately
+- Multiple independent Raft groups in one process. Each group has its own membership, log, vote, snapshot, state machine, and leader
 
-Not in this phase: multi-raft, chaos frameworks, OpenTelemetry, and a standalone server or key-value application. Followers do not forward reads.
+Not in this phase: placing keys onto groups, cross-group transactions, chaos frameworks, OpenTelemetry, and a standalone server or key-value application. Followers do not forward reads.
 
 ## Protocol notes
 
 Time is a tick count, not a wall clock. `RaftNode::tick()` advances one unit. Tests set `election_timeout_min == election_timeout_max` so campaigns are reproducible. Heartbeats are empty AppendEntries.
 
 Votes use OpenRaft's default leader id `(term, node_id)`, totally ordered, plus a `committed` bit. A node grants a request when the candidate's vote is at least the vote it has stored and the candidate's log is at least as up to date. A higher node id can supersede another candidate in the same term. `committed` marks an established leader and is greater than that leader's non-committed vote.
+
+Every envelope also carries a `GroupId`. `PreVote`, `RequestVote`, `AppendEntries`, `InstallSnapshot`, and `TimeoutNow` are otherwise the same payloads. A node applies one of those only when the envelope's group equals its own, and it stamps that id on every message it sends. An envelope for another group is ignored and not answered, so it cannot grant a vote, append, truncate, or install a snapshot. Group 0 is a real group and the one a single-group `RaftNode` uses. Ticking, elections, leases, reads, transfers, and membership changes stay inside the group. Heartbeat, election, and lease intervals are that group's `Config`.
 
 PreVote asks peers whether they would grant `term + 1` and changes nothing locally. A single-node voter set skips the round and campaigns immediately. A follower that still has a leader lease (a recent AppendEntries from the leader it follows) rejects both PreVote and an ordinary RequestVote, so a partitioned node cannot inflate the term and knock over a healthy leader when it returns. A RequestVote whose `leadership_transfer_from` equals the committed vote this node already follows is the exception: the current leader asked for that election, and the lease does not reject it. The lease interval itself is unchanged. PreVote never carries that field.
 
@@ -89,6 +92,43 @@ node.transfer_leader(2);
 const auto handed = node.poll_leader_transfer();
 ```
 
+## Multiple Raft groups
+
+A group is one independent Raft. It has its own membership, log, vote, snapshot, commit index, state machine, and leader. Groups do not share a log or a commit index. `tick` on one group does not move another's election timer, and a message or snapshot for one group is never applied to another. `snapshot_threshold` still defaults to 0, so a group does not compact unless its own config opts in.
+
+`RaftNode`'s constructor takes an optional group id. Omitting it leaves the node in group 0, and outbound envelopes keep `Envelope::group` at 0. A caller that needs one group keeps constructing `RaftNode` as before.
+
+`RaftGroups` hosts several of those nodes for one node id. `add` takes that group's config, log storage, and state machine. The storage and the state machine must be non-null and not already held by another group on the host. `tick` advances every group in ascending group id, each on its own timer. `on_message` delivers an envelope to the group it names when `to` is this node. Any other destination, or a group the host does not run, is dropped. The node checks the group again before the engine sees the payload.
+
+`FileLogStorage::open_group(root, id)` creates `root/groups/<id>/` and stores `vote`, `membership`, `log`, and `snapshot` there. `<id>` is the decimal group id. Two groups never share a log file, and those files are not written into `root` itself. The single-group `FileLogStorage(directory)` constructor is unchanged: its files stay directly in `directory`. `MemoryGroupStore::open(id)` returns one `MemoryLogStorage` for that group and the same instance if it is opened again. Restarting a group opens the same directory, or the same in-memory log, and rebuilds a `RaftNode` from it.
+
+This is the primitive for running more than one group in a process. It does not place keys onto groups or commit a transaction across groups.
+
+```cpp
+easyraft::MemoryGroupStore logs;
+auto alpha_log = logs.open(10);
+auto beta_log = logs.open(20);
+auto alpha_state = std::make_shared<easyraft::MemoryStateMachine>();
+auto beta_state = std::make_shared<easyraft::MemoryStateMachine>();
+
+easyraft::RaftGroups groups(1, bus);
+groups.add(10, easyraft::Config{}, alpha_log, alpha_state);
+groups.add(20, easyraft::Config{}, beta_log, beta_state);
+groups.find(10)->initialize(easyraft::Membership{{1, 2, 3}});
+groups.find(20)->initialize(easyraft::Membership{{1, 2, 3}});
+groups.tick();
+groups.on_message(envelope);
+```
+
+On disk, one process uses one data directory and a subdirectory per group:
+
+```cpp
+auto alpha = easyraft::FileLogStorage::open_group("/var/lib/easyraft/1", 10);
+auto beta = easyraft::FileLogStorage::open_group("/var/lib/easyraft/1", 20);
+```
+
+Those open `/var/lib/easyraft/1/groups/10` and `/var/lib/easyraft/1/groups/20`.
+
 A follower accepts AppendEntries only after it accepts the leader's vote. If `prev_log_id` does not match, it truncates at that index and rejects. If the prefix matches, identical entries are kept and only the conflicting tail is deleted before the new suffix is appended. The commit index never advances past the prefix just checked against the leader. A prev id that names the snapshot's last included entry matches that compacted prefix, and truncation never deletes the snapshot.
 
 ## Snapshots
@@ -109,10 +149,11 @@ When a follower's `next_index` is below the leader's first available index, the 
 | --- | --- |
 | `include/easyraft/engine.hpp` | Pure protocol state machine |
 | `include/easyraft/node.hpp` | Runtime: timeouts, heartbeats, client writes, membership changes, reads, leader transfer, RPC dispatch |
+| `include/easyraft/groups.hpp` | Several independent groups on one node id |
 | `include/easyraft/storage.hpp` | `RaftLogStorage` |
 | `include/easyraft/state_machine.hpp` | `RaftStateMachine` |
 | `include/easyraft/network.hpp` | `MessageBus` |
-| `include/easyraft/memory.hpp` | In-memory storage and state machine |
+| `include/easyraft/memory.hpp` | In-memory storage, per-group logs, and state machine |
 | `include/easyraft/file.hpp` | Durable directory storage (`FileLogStorage`) |
 | `tests/cluster.hpp` | In-process cluster with a fake clock |
 
@@ -149,6 +190,8 @@ node.tick();  // repeat until role() == Role::Leader
 auto index = node.write("value");
 ```
 
+That node is group 0. Pass a group id as the last constructor argument to run it as another group, or use `RaftGroups` when one process hosts more than one.
+
 On a multi-node cluster, pass a `MessageBus` and deliver envelopes back through `RaftNode::on_message`. `write` returns `Error::NotLeader` when the node cannot accept the proposal, and `Error::Rejected` while a leader transfer is in flight. `current_leader()` is the established leader, when this node knows one. `linearizable_read` and `lease_read` return `Error::NotLeader` from a follower or a learner. A linearizable read on the leader stays `Error::Pending` until `poll_linearizable_read` returns the read index. The state machine has applied at least that index. `lease_read` returns that index only while the read lease is valid and the state machine has applied it. Otherwise it returns `Error::LeaseExpired` or `Error::Rejected` and does not substitute a quorum read. `poll_linearizable_read` consumes a finished id. `cancel_read` drops one. `Config::max_in_flight_reads` bounds how many ids a node will hold. `transfer_leader` returns `Error::NotLeader` from a follower or a learner and `Error::Rejected` for a learner, an unknown id, or this node. `poll_leader_transfer` stays `Error::Pending` until the target leads or the transfer fails with `Error::TransferFailed`.
 
 ```cpp
@@ -176,6 +219,8 @@ auto machine = std::make_shared<easyraft::MemoryStateMachine>();
 easyraft::RaftNode node(1, easyraft::Config{}, storage, machine, /*bus=*/nullptr);
 node.initialize(easyraft::Membership{{1}});
 ```
+
+`FileLogStorage::open_group(root, group)` is that same layout under `root/groups/<group>/`. A directory opened with the single-group constructor is not a group subdirectory, and a group's `log` is not the `log` file in `root`.
 
 ```cpp
 node.trigger_snapshot();
