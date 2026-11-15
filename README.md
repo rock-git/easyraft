@@ -1,6 +1,6 @@
 # easyraft
 
-easyraft is a small C++20 implementation of the [Raft](https://raft.github.io/) consensus protocol. Phase 1 is the core algorithm: leader election, log replication, flexible quorums, joint-consensus membership changes, learners, log snapshots, linearizable and lease reads, and restart from a persisted vote, membership, log, and snapshot.
+easyraft is a small C++20 implementation of the [Raft](https://raft.github.io/) consensus protocol. Phase 1 is the core algorithm: leader election, log replication, flexible quorums, joint-consensus membership changes, learners, log snapshots, linearizable and lease reads, leader transfer, and restart from a persisted vote, membership, log, and snapshot.
 
 The design follows the OpenRaft 0.10 line (`release-0.10`, published as 0.10.0): a pure, tick-driven engine decides, and a thin runtime performs storage and network I/O. This is an independent implementation inspired by that design. It is not an official OpenRaft port and it does not contain OpenRaft source code. OpenRaft is a Databend project and is derived from the original async-raft work. See `NOTICE`.
 
@@ -17,8 +17,9 @@ Included:
 - Learners: non-voting replicators that receive the log and snapshots and do not count toward quorum
 - Snapshots of applied state, crash-safe log compaction, and `InstallSnapshot` catch-up for a lagging voter, a new voter, or a learner
 - Linearizable reads (a ReadIndex round on the leader) and lease reads that reuse the leader's existing lease
+- Leader transfer: the leader catches up one voter, then that voter campaigns immediately
 
-Not in this phase: leader transfer, multi-raft, chaos frameworks, OpenTelemetry, and a standalone server or key-value application. Followers do not forward reads.
+Not in this phase: multi-raft, chaos frameworks, OpenTelemetry, and a standalone server or key-value application. Followers do not forward reads.
 
 ## Protocol notes
 
@@ -26,7 +27,7 @@ Time is a tick count, not a wall clock. `RaftNode::tick()` advances one unit. Te
 
 Votes use OpenRaft's default leader id `(term, node_id)`, totally ordered, plus a `committed` bit. A node grants a request when the candidate's vote is at least the vote it has stored and the candidate's log is at least as up to date. A higher node id can supersede another candidate in the same term. `committed` marks an established leader and is greater than that leader's non-committed vote.
 
-PreVote asks peers whether they would grant `term + 1` and changes nothing locally. A single-node voter set skips the round and campaigns immediately. A follower that still has a leader lease (a recent AppendEntries from the leader it follows) rejects both PreVote and RequestVote, so a partitioned node cannot inflate the term and knock over a healthy leader when it returns.
+PreVote asks peers whether they would grant `term + 1` and changes nothing locally. A single-node voter set skips the round and campaigns immediately. A follower that still has a leader lease (a recent AppendEntries from the leader it follows) rejects both PreVote and an ordinary RequestVote, so a partitioned node cannot inflate the term and knock over a healthy leader when it returns. A RequestVote whose `leadership_transfer_from` equals the committed vote this node already follows is the exception: the current leader asked for that election, and the lease does not reject it. The lease interval itself is unchanged. PreVote never carries that field.
 
 On winning an election the leader appends a blank entry. Only entries written by the current leader move the commit index; once one of those is on a commit quorum of every config in the effective membership, the prefix before it is committed too. That is how entries from the previous term become committed, and how a restarted leader avoids treating an unreplicated suffix as committed. PreVote and RequestVote count an election quorum. The leader lease counts a commit quorum, the same set that can advance the commit index. Linearizable reads confirm leadership with that same commit quorum. Lease reads are local and are allowed only while that lease is still valid.
 
@@ -70,6 +71,24 @@ const auto index = node.poll_linearizable_read(*id);
 const auto leased = node.lease_read();
 ```
 
+## Leader transfer
+
+`RaftNode::transfer_leader(target)` is leader-only. A follower or a learner returns `Error::NotLeader`. The target has to be a different current voter that can win an election under the effective membership. That check uses the election quorum of every voter config, so a joint config and a non-default threshold are the same rules as any other election. Every current voter of a valid threshold membership can win, including a voter that sits on only one side of a joint config, because voters on the other side can still grant. A learner cannot. An unknown id, id 0, and this node return `Error::Rejected`. The call does not choose a different node when the target is missing or unreachable.
+
+The call returns when the transfer has been accepted. `RaftNode::poll_leader_transfer` returns `Error::Pending` until it finishes. Tick and deliver RPCs between polls. Success means `target` became the committed leader. The result stays until the next `transfer_leader`.
+
+While a transfer is in flight the leader rejects client writes, membership changes, and new linearizable or lease reads with `Error::Rejected`. A read that was already started is left in place. If this node steps down first, that read is aborted and its poll returns `Error::NotLeader`, the same as any other lost leadership. After a failed transfer, a node that is still leader accepts writes again.
+
+Catch-up uses the existing `AppendEntries` and `InstallSnapshot` path. There is no second heartbeat. When the target's match index reaches the leader's last index, the leader sends `TimeoutNow`. The target campaigns immediately, without PreVote, only if `TimeoutNow` names the committed vote it already follows and its log is at least that last index. A repeat does not bump the term again. Learners ignore `TimeoutNow` and still do not vote. The RequestVote carries `leadership_transfer_from`, and voters grant it during a valid lease only when that vote is the leader they follow. A transfer authorized by any other leader is an ordinary vote and the lease still rejects it.
+
+The leader waits `election_timeout_min` ticks for the target to catch up. If the target is still behind, `poll_leader_transfer` returns `Error::TransferFailed` and no `TimeoutNow` is required for that failure. The first time the target matches, the election gets another `election_timeout_min` ticks. If the target has not become leader by then, or another node becomes the committed leader first, the poll returns `Error::TransferFailed`. Time is ticks, not a wall clock. `heartbeat_interval`, `election_timeout_min`, `election_timeout_max`, and `snapshot_threshold` are unchanged. The default snapshot threshold stays 0.
+
+```cpp
+node.transfer_leader(2);
+// tick and deliver RPCs until poll_leader_transfer() is not Pending
+const auto handed = node.poll_leader_transfer();
+```
+
 A follower accepts AppendEntries only after it accepts the leader's vote. If `prev_log_id` does not match, it truncates at that index and rejects. If the prefix matches, identical entries are kept and only the conflicting tail is deleted before the new suffix is appended. The commit index never advances past the prefix just checked against the leader. A prev id that names the snapshot's last included entry matches that compacted prefix, and truncation never deletes the snapshot.
 
 ## Snapshots
@@ -89,7 +108,7 @@ When a follower's `next_index` is below the leader's first available index, the 
 | Path | Role |
 | --- | --- |
 | `include/easyraft/engine.hpp` | Pure protocol state machine |
-| `include/easyraft/node.hpp` | Runtime: timeouts, heartbeats, client writes, membership changes, reads, RPC dispatch |
+| `include/easyraft/node.hpp` | Runtime: timeouts, heartbeats, client writes, membership changes, reads, leader transfer, RPC dispatch |
 | `include/easyraft/storage.hpp` | `RaftLogStorage` |
 | `include/easyraft/state_machine.hpp` | `RaftStateMachine` |
 | `include/easyraft/network.hpp` | `MessageBus` |
@@ -130,7 +149,7 @@ node.tick();  // repeat until role() == Role::Leader
 auto index = node.write("value");
 ```
 
-On a multi-node cluster, pass a `MessageBus` and deliver envelopes back through `RaftNode::on_message`. `write` returns `Error::NotLeader` when the node cannot accept the proposal. `current_leader()` is the established leader, when this node knows one. `linearizable_read` and `lease_read` return `Error::NotLeader` from a follower or a learner. A linearizable read on the leader stays `Error::Pending` until `poll_linearizable_read` returns the read index. The state machine has applied at least that index. `lease_read` returns that index only while the read lease is valid and the state machine has applied it. Otherwise it returns `Error::LeaseExpired` or `Error::Rejected` and does not substitute a quorum read. `poll_linearizable_read` consumes a finished id. `cancel_read` drops one. `Config::max_in_flight_reads` bounds how many ids a node will hold.
+On a multi-node cluster, pass a `MessageBus` and deliver envelopes back through `RaftNode::on_message`. `write` returns `Error::NotLeader` when the node cannot accept the proposal, and `Error::Rejected` while a leader transfer is in flight. `current_leader()` is the established leader, when this node knows one. `linearizable_read` and `lease_read` return `Error::NotLeader` from a follower or a learner. A linearizable read on the leader stays `Error::Pending` until `poll_linearizable_read` returns the read index. The state machine has applied at least that index. `lease_read` returns that index only while the read lease is valid and the state machine has applied it. Otherwise it returns `Error::LeaseExpired` or `Error::Rejected` and does not substitute a quorum read. `poll_linearizable_read` consumes a finished id. `cancel_read` drops one. `Config::max_in_flight_reads` bounds how many ids a node will hold. `transfer_leader` returns `Error::NotLeader` from a follower or a learner and `Error::Rejected` for a learner, an unknown id, or this node. `poll_leader_transfer` stays `Error::Pending` until the target leads or the transfer fails with `Error::TransferFailed`.
 
 ```cpp
 auto changed = node.change_membership({1, 2, 4});
