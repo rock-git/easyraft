@@ -84,6 +84,75 @@ TEST(Engine, PreVoteDoesNotPersistOrBumpTerm) {
   EXPECT_EQ(engine.term(), 0u);
 }
 
+std::uint64_t prevote_probe(const StepResult& step);
+
+TEST(Engine, LeadershipTransferVoteBypassesOnlyTheAuthorizingLeaderLease) {
+  Engine leader(1, pinned(6));
+  leader.recover(Membership{{1, 2, 3}}, Vote{}, {});
+  std::uint64_t probe = 0;
+  for (int tick = 0; tick < 20 && leader.role() != Role::Leader; ++tick) {
+    probe = std::max(probe, prevote_probe(leader.on_tick()));
+    if (probe != 0 && leader.role() != Role::Leader && leader.term() == 0) {
+      PreVoteResponse grant;
+      grant.probe = probe;
+      grant.body.granted = true;
+      leader.on_pre_vote_response(2, grant);
+    }
+    if (leader.role() == Role::Candidate) {
+      VoteResponse vote;
+      vote.granted = true;
+      vote.vote = leader.vote();
+      leader.on_vote_response(2, vote);
+    }
+  }
+  ASSERT_EQ(leader.role(), Role::Leader);
+  ASSERT_FALSE(leader.log().empty());
+
+  VoteRequest ordinary;
+  ordinary.vote = Vote{LeaderId{leader.term() + 1, 2}, false};
+  ordinary.last_log_id = leader.log().back().id;
+  EXPECT_FALSE(leader.on_vote(ordinary).response.granted);
+  EXPECT_EQ(leader.role(), Role::Leader);
+  EXPECT_EQ(leader.term(), 1u);
+
+  VoteRequest wrong_leader = ordinary;
+  wrong_leader.leadership_transfer_from = Vote{LeaderId{leader.term(), 9}, true};
+  EXPECT_FALSE(leader.on_vote(wrong_leader).response.granted);
+  EXPECT_EQ(leader.role(), Role::Leader);
+
+  Engine follower(3, pinned(6));
+  const Vote followed = leader.vote();
+  follower.recover(Membership{{1, 2, 3}}, followed, leader.log());
+  AppendEntriesRequest heartbeat;
+  heartbeat.vote = followed;
+  heartbeat.prev_log_id = leader.log().back().id;
+  follower.on_append(heartbeat);
+
+  EXPECT_FALSE(follower.on_vote(ordinary).response.granted);
+  EXPECT_EQ(follower.term(), followed.leader.term);
+  EXPECT_FALSE(follower.on_pre_vote(wrong_leader).response.granted);
+  EXPECT_EQ(follower.vote(), followed);
+
+  VoteRequest wrong_follower = ordinary;
+  wrong_follower.leadership_transfer_from = Vote{LeaderId{followed.leader.term, 8}, true};
+  EXPECT_FALSE(follower.on_vote(wrong_follower).response.granted);
+  EXPECT_EQ(follower.vote(), followed);
+
+  VoteRequest authorized = ordinary;
+  authorized.leadership_transfer_from = followed;
+  const VoteStep granted = follower.on_vote(authorized);
+  EXPECT_TRUE(granted.response.granted);
+  EXPECT_EQ(follower.vote().leader.node, 2u);
+  EXPECT_FALSE(follower.vote().committed);
+
+  VoteRequest leader_authorized = ordinary;
+  leader_authorized.leadership_transfer_from = leader.vote();
+  const VoteStep leader_granted = leader.on_vote(leader_authorized);
+  EXPECT_TRUE(leader_granted.response.granted);
+  EXPECT_NE(leader.role(), Role::Leader);
+  EXPECT_EQ(leader.vote().leader.node, 2u);
+}
+
 TEST(Engine, RealVotePersistsGrant) {
   Engine engine(2, pinned(5));
   engine.recover(Membership{{1, 2, 3}}, Vote{}, {});

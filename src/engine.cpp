@@ -435,10 +435,15 @@ VoteStep Engine::on_vote(const VoteRequest& request) {
 
   const bool from_current_leader = vote_.committed && request.vote.leader.node == vote_.leader.node &&
                                    request.vote.leader.node != 0;
-  if (leading_ && leader_quorum_lease_valid() && !from_current_leader) {
+  // A leadership transfer is the current leader telling followers to elect
+  // now. The lease still rejects every other vote, including a transfer
+  // authorized by a leader this node does not follow.
+  const bool transfer_authorized = request.leadership_transfer_from && vote_.committed &&
+                                   *request.leadership_transfer_from == vote_;
+  if (leading_ && leader_quorum_lease_valid() && !from_current_leader && !transfer_authorized) {
     return step;
   }
-  if (follower_lease_valid() && !from_current_leader) {
+  if (follower_lease_valid() && !from_current_leader && !transfer_authorized) {
     return step;
   }
   if (!log_is_up_to_date(request.last_log_id, last_log_id())) {
