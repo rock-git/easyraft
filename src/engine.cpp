@@ -154,6 +154,7 @@ StepResult Engine::recover(Membership membership,
   pre_campaign_.reset();
   progress_.clear();
   reads_.clear();
+  transfer_.reset();
   ever_contacted_ = false;
   if (!snapshot_) {
     base_membership_ = infer_base(membership);
@@ -186,8 +187,10 @@ StepResult Engine::on_tick() {
       ticks_since_heartbeat_ = 0;
       replicate_all(out);
     }
+    drive_transfer(out);
     return out;
   }
+  drive_transfer(out);
   if (now_ >= next_election_at_) {
     election_timeout_ticks_ = sample_timeout();
     next_election_at_ = now_ + election_timeout_ticks_;
@@ -205,7 +208,7 @@ StepResult Engine::on_tick() {
 
 ProposeResult Engine::propose(std::string data) {
   ProposeResult result;
-  if (!initialized_ || role_ != Role::Leader) {
+  if (!initialized_ || role_ != Role::Leader || leader_transfer_active()) {
     return result;
   }
   append_local(result.step, EntryKind::Application, std::move(data));
@@ -217,7 +220,7 @@ ProposeResult Engine::propose(std::string data) {
 
 ProposeResult Engine::change_membership(std::vector<NodeId> voters, Quorum quorum) {
   ProposeResult result;
-  if (!initialized_ || !leading_ || role_ != Role::Leader) {
+  if (!initialized_ || !leading_ || role_ != Role::Leader || leader_transfer_active()) {
     return result;
   }
   std::sort(voters.begin(), voters.end());
@@ -250,7 +253,8 @@ ProposeResult Engine::change_membership(std::vector<NodeId> voters, Quorum quoru
 
 ProposeResult Engine::change_quorum(Quorum quorum) {
   ProposeResult result;
-  if (!initialized_ || !leading_ || role_ != Role::Leader || membership_changing()) {
+  if (!initialized_ || !leading_ || role_ != Role::Leader || leader_transfer_active() ||
+      membership_changing()) {
     return result;
   }
   if (membership_.is_joint() || membership_.configs().size() != 1 || membership_.empty()) {
@@ -287,7 +291,8 @@ ProposeResult Engine::change_quorum(Quorum quorum) {
 
 ProposeResult Engine::add_learner(NodeId learner) {
   ProposeResult result;
-  if (!initialized_ || !leading_ || role_ != Role::Leader || membership_changing()) {
+  if (!initialized_ || !leading_ || role_ != Role::Leader || leader_transfer_active() ||
+      membership_changing()) {
     return result;
   }
   if (learner == 0 || membership_.empty() || membership_.is_joint() ||
@@ -308,7 +313,8 @@ ProposeResult Engine::add_learner(NodeId learner) {
 
 ProposeResult Engine::remove_learner(NodeId learner) {
   ProposeResult result;
-  if (!initialized_ || !leading_ || role_ != Role::Leader || membership_changing()) {
+  if (!initialized_ || !leading_ || role_ != Role::Leader || leader_transfer_active() ||
+      membership_changing()) {
     return result;
   }
   if (!membership_.is_learner(learner) || membership_.is_joint()) {
@@ -333,7 +339,8 @@ ProposeResult Engine::remove_learner(NodeId learner) {
 
 ProposeResult Engine::demote_voter(NodeId voter) {
   ProposeResult result;
-  if (!initialized_ || !leading_ || role_ != Role::Leader || membership_changing()) {
+  if (!initialized_ || !leading_ || role_ != Role::Leader || leader_transfer_active() ||
+      membership_changing()) {
     return result;
   }
   if (voter == 0 || membership_.is_joint() || !membership_.contains(voter) ||
@@ -639,6 +646,7 @@ StepResult Engine::on_append_response(NodeId from, const AppendEntriesResponse& 
     } else if (progress.next_index <= last_index_) {
       send_append(out, from);
     }
+    drive_transfer(out);
     return out;
   }
   if (response.rejected_by_vote) {
@@ -732,6 +740,20 @@ std::string Engine::debug() const {
     out << learners[i];
   }
   out << "]";
+  if (transfer_) {
+    out << " transfer=" << transfer_->target;
+    switch (transfer_->status) {
+      case Transfer::Status::Running:
+        out << " running";
+        break;
+      case Transfer::Status::Succeeded:
+        out << " succeeded";
+        break;
+      case Transfer::Status::Failed:
+        out << " failed";
+        break;
+    }
+  }
   return out.str();
 }
 
@@ -886,6 +908,7 @@ bool Engine::update_vote(StepResult& out, const Vote& incoming) {
   if (vote_.committed && vote_.leader.node != id_) {
     note_leader_contact();
   }
+  observe_transfer();
   return true;
 }
 
@@ -912,6 +935,11 @@ void Engine::become_leader(StepResult& out) {
     progress_.emplace(peer, progress);
   }
   replicate_all(out);
+  // A new term of our own means the handoff did not stick.
+  if (transfer_ && transfer_->status == Transfer::Status::Running &&
+      vote_.leader != transfer_->authorizing.leader) {
+    transfer_->status = Transfer::Status::Failed;
+  }
 }
 
 void Engine::step_down(StepResult& out) {
@@ -1035,7 +1063,7 @@ void Engine::abort_reads(StepResult& out) {
 
 ReadStart Engine::begin_linearizable_read() {
   ReadStart started;
-  if (!initialized_ || !leading_ || role_ != Role::Leader) {
+  if (!initialized_ || !leading_ || role_ != Role::Leader || leader_transfer_active()) {
     return started;
   }
   if (reads_.size() >= config_.max_in_flight_reads) {
@@ -1083,6 +1111,9 @@ Result<LogIndex> Engine::lease_read() const {
   }
   if (!leading_ || role_ != Role::Leader) {
     return Result<LogIndex>::failure(Error::NotLeader);
+  }
+  if (leader_transfer_active()) {
+    return Result<LogIndex>::failure(Error::Rejected);
   }
   if (!leader_read_lease_valid()) {
     return Result<LogIndex>::failure(Error::LeaseExpired);
@@ -1268,10 +1299,17 @@ void Engine::send_append(StepResult& out, NodeId to) {
   out.outbound.push_back(std::move(message));
 }
 
-void Engine::send_vote_requests(StepResult& out, bool pre_vote, const Vote& vote) {
+void Engine::send_vote_requests(StepResult& out,
+                                bool pre_vote,
+                                const Vote& vote,
+                                std::optional<Vote> transfer_from) {
   VoteRequest request;
   request.vote = vote;
   request.last_log_id = last_log_id();
+  // PreVote never carries a transfer. The field would not be consulted.
+  if (!pre_vote) {
+    request.leadership_transfer_from = std::move(transfer_from);
+  }
   for (NodeId voter : membership_.voters()) {
     if (voter == id_) {
       continue;
@@ -1314,9 +1352,11 @@ void Engine::pre_elect(StepResult& out) {
   send_vote_requests(out, true, probed);
 }
 
-void Engine::elect(StepResult& out) {
+void Engine::elect(StepResult& out, std::optional<Vote> transfer_from) {
   pre_campaign_.reset();
-  if (leading_ && leader_quorum_lease_valid()) {
+  // A transfer election was requested by the leader the target still follows.
+  // The lease that would suppress an ordinary campaign does not apply.
+  if (!transfer_from && leading_ && leader_quorum_lease_valid()) {
     return;
   }
   step_down(out);
@@ -1338,7 +1378,7 @@ void Engine::elect(StepResult& out) {
     return;
   }
   role_ = Role::Candidate;
-  send_vote_requests(out, false, candidate_vote);
+  send_vote_requests(out, false, candidate_vote, std::move(transfer_from));
 }
 
 void Engine::adopt_membership(StepResult& out, Membership next) {
@@ -1770,6 +1810,7 @@ StepResult Engine::on_install_response(NodeId from, const InstallSnapshotRespons
     } else {
       send_append(out, from);
     }
+    drive_transfer(out);
     return out;
   }
   if (response.success) {
@@ -1816,6 +1857,141 @@ void Engine::send_snapshot(StepResult& out, NodeId to) {
   message.to = to;
   message.payload = std::move(request);
   out.outbound.push_back(std::move(message));
+}
+
+bool Engine::leader_transfer_active() const {
+  return transfer_ && transfer_->status == Transfer::Status::Running;
+}
+
+bool Engine::electable_target(NodeId target) const {
+  if (target == 0 || target == id_ || !membership_.contains(target) || membership_.is_learner(target)) {
+    return false;
+  }
+  // Best case: every current voter grants. That is an election quorum of
+  // every config, including a joint pair and a non-default threshold, or the
+  // membership cannot elect anyone. A learner is not a voter and cannot grant.
+  return membership_.is_election_quorum([](NodeId) { return true; });
+}
+
+bool Engine::transfer_target_caught_up(NodeId target) const {
+  const auto found = progress_.find(target);
+  return found != progress_.end() && found->second.match_index >= last_index_;
+}
+
+void Engine::observe_transfer() {
+  if (!transfer_ || transfer_->status != Transfer::Status::Running) {
+    return;
+  }
+  if (!vote_.committed || vote_.leader.node == 0 || vote_.leader.node == id_) {
+    return;
+  }
+  if (vote_.leader.node == transfer_->target) {
+    transfer_->status = Transfer::Status::Succeeded;
+  } else {
+    transfer_->status = Transfer::Status::Failed;
+  }
+}
+
+void Engine::send_timeout_now(StepResult& out) {
+  if (!transfer_ || !leading_) {
+    return;
+  }
+  TimeoutNow request;
+  request.leader = vote_;
+  request.last_log_id = last_log_id();
+  Outbound message;
+  message.to = transfer_->target;
+  message.payload = std::move(request);
+  out.outbound.push_back(std::move(message));
+}
+
+void Engine::drive_transfer(StepResult& out) {
+  if (!leader_transfer_active()) {
+    return;
+  }
+  observe_transfer();
+  if (!leader_transfer_active()) {
+    return;
+  }
+  if (!electable_target(transfer_->target)) {
+    transfer_->status = Transfer::Status::Failed;
+    return;
+  }
+  // The first time the target matches, start the election window even if the
+  // catch-up bound expires on this same tick. A target that is still behind
+  // when the bound expires fails without a TimeoutNow.
+  if (leading_ && transfer_target_caught_up(transfer_->target)) {
+    const bool first = !transfer_->timeout_sent;
+    send_timeout_now(out);
+    if (first) {
+      transfer_->timeout_sent = true;
+      transfer_->deadline = now_ + static_cast<std::uint64_t>(config_.election_timeout_min);
+      return;
+    }
+  }
+  if (now_ >= transfer_->deadline) {
+    transfer_->status = Transfer::Status::Failed;
+  }
+}
+
+TransferStart Engine::begin_transfer(NodeId target) {
+  TransferStart started;
+  if (!initialized_ || !leading_ || role_ != Role::Leader) {
+    return started;
+  }
+  if (leader_transfer_active() || !electable_target(target)) {
+    return started;
+  }
+  Transfer handoff;
+  handoff.target = target;
+  handoff.authorizing = vote_;
+  handoff.deadline = now_ + static_cast<std::uint64_t>(config_.election_timeout_min);
+  handoff.status = Transfer::Status::Running;
+  transfer_ = handoff;
+  send_append(started.step, target);
+  drive_transfer(started.step);
+  started.accepted = true;
+  return started;
+}
+
+Result<void> Engine::poll_transfer() const {
+  if (!initialized_) {
+    return Result<void>::failure(Error::NotInitialized);
+  }
+  if (!transfer_) {
+    return Result<void>::failure(Error::Rejected);
+  }
+  switch (transfer_->status) {
+    case Transfer::Status::Running:
+      return Result<void>::failure(Error::Pending);
+    case Transfer::Status::Succeeded:
+      return Result<void>::success();
+    case Transfer::Status::Failed:
+      return Result<void>::failure(Error::TransferFailed);
+  }
+  return Result<void>::failure(Error::Rejected);
+}
+
+StepResult Engine::on_timeout_now(const TimeoutNow& request) {
+  StepResult out;
+  // Learners are not voters and must not campaign. A leader does not campaign
+  // on its own TimeoutNow.
+  if (!initialized_ || leading_ || !membership_.contains(id_)) {
+    return out;
+  }
+  if (!request.leader.committed || request.leader != vote_) {
+    return out;
+  }
+  if (!log_is_up_to_date(last_log_id(), request.last_log_id)) {
+    return out;
+  }
+  // The first TimeoutNow already moved the vote. Another one must not bump
+  // the term again.
+  if (vote_ > request.leader) {
+    return out;
+  }
+  elect(out, request.leader);
+  return out;
 }
 
 }  // namespace easyraft

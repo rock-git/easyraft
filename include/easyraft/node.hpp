@@ -77,8 +77,23 @@ class RaftNode {
   // from the request's send tick and capped by each voter's `election_timeout_min`.
   // `LeaseExpired` returns no index and does not fall back to `linearizable_read`.
   // `Rejected` means the lease is valid but this term's commit is not applied
-  // yet. Followers and learners return `NotLeader`.
+  // yet. Followers and learners return `NotLeader`. A leader that has a
+  // transfer in flight returns `Rejected` and does not start a read.
   Result<LogIndex> lease_read();
+  // Leader only. Catches `target` up with the existing replication path, then
+  // sends TimeoutNow so that voter campaigns immediately. `target` must be a
+  // different current voter that can win under the effective membership,
+  // including a joint config and a non-default election quorum. A learner, an
+  // unknown id, and this node are rejected. The leader does not choose a
+  // different node. While the transfer runs, client writes, membership
+  // changes, and new read rounds return `Rejected`. Poll until the result is
+  // not `Pending`. Success means `target` is the committed leader.
+  // `TransferFailed` means the target was not caught up within
+  // `election_timeout_min` ticks, or did not become leader within another
+  // `election_timeout_min` ticks after TimeoutNow, or another node became
+  // leader. A leader that is still in charge then accepts writes again.
+  Result<void> transfer_leader(NodeId target);
+  Result<void> poll_leader_transfer() const;
   void tick();
 
   void on_message(const Envelope& message);

@@ -112,6 +112,9 @@ Result<LogIndex> RaftNode::write(std::string data) {
   if (role() != Role::Leader) {
     return Result<LogIndex>::failure(Error::NotLeader);
   }
+  if (engine_.leader_transfer_active()) {
+    return Result<LogIndex>::failure(Error::Rejected);
+  }
   ProposeResult proposed = engine_.propose(std::move(data));
   if (!proposed.accepted) {
     return Result<LogIndex>::failure(Error::NotLeader);
@@ -137,6 +140,9 @@ Result<LogIndex> RaftNode::change_membership(std::vector<NodeId> voters, Quorum 
   if (role() != Role::Leader) {
     return Result<LogIndex>::failure(Error::NotLeader);
   }
+  if (engine_.leader_transfer_active()) {
+    return Result<LogIndex>::failure(Error::Rejected);
+  }
   std::vector<NodeId> unique = voters;
   std::sort(unique.begin(), unique.end());
   unique.erase(std::unique(unique.begin(), unique.end()), unique.end());
@@ -158,6 +164,9 @@ Result<LogIndex> RaftNode::change_quorum(Quorum quorum) {
   }
   if (role() != Role::Leader) {
     return Result<LogIndex>::failure(Error::NotLeader);
+  }
+  if (engine_.leader_transfer_active()) {
+    return Result<LogIndex>::failure(Error::Rejected);
   }
   // An in-flight change is retryable. Report it before rejecting the
   // definition, including while the current config is still joint.
@@ -195,6 +204,9 @@ Result<LogIndex> RaftNode::add_learner(NodeId learner) {
   if (role() != Role::Leader) {
     return Result<LogIndex>::failure(Error::NotLeader);
   }
+  if (engine_.leader_transfer_active()) {
+    return Result<LogIndex>::failure(Error::Rejected);
+  }
   if (learner == 0 || membership().contains(learner) || membership().is_learner(learner)) {
     return Result<LogIndex>::failure(Error::InvalidMembership);
   }
@@ -214,6 +226,9 @@ Result<LogIndex> RaftNode::remove_learner(NodeId learner) {
   if (role() != Role::Leader) {
     return Result<LogIndex>::failure(Error::NotLeader);
   }
+  if (engine_.leader_transfer_active()) {
+    return Result<LogIndex>::failure(Error::Rejected);
+  }
   if (!membership().is_learner(learner)) {
     return Result<LogIndex>::failure(Error::InvalidMembership);
   }
@@ -232,6 +247,9 @@ Result<LogIndex> RaftNode::demote_voter(NodeId voter) {
   }
   if (role() != Role::Leader) {
     return Result<LogIndex>::failure(Error::NotLeader);
+  }
+  if (engine_.leader_transfer_active()) {
+    return Result<LogIndex>::failure(Error::Rejected);
   }
   if (voter == 0 || !membership().contains(voter) || membership().voters().size() < 2) {
     return Result<LogIndex>::failure(Error::InvalidMembership);
@@ -256,6 +274,9 @@ Result<std::uint64_t> RaftNode::linearizable_read() {
   }
   if (role() != Role::Leader) {
     return Result<std::uint64_t>::failure(Error::NotLeader);
+  }
+  if (engine_.leader_transfer_active()) {
+    return Result<std::uint64_t>::failure(Error::Rejected);
   }
   if (tracked_reads() >= engine_.max_in_flight_reads()) {
     return Result<std::uint64_t>::failure(Error::Rejected);
@@ -283,6 +304,9 @@ Result<LogIndex> RaftNode::lease_read() {
   if (!initialized_) {
     return Result<LogIndex>::failure(Error::NotInitialized);
   }
+  if (engine_.leader_transfer_active()) {
+    return Result<LogIndex>::failure(Error::Rejected);
+  }
   const Result<LogIndex> result = engine_.lease_read();
   if (!result.ok()) {
     return result;
@@ -293,6 +317,41 @@ Result<LogIndex> RaftNode::lease_read() {
     return Result<LogIndex>::failure(Error::Rejected);
   }
   return result;
+}
+
+Result<void> RaftNode::transfer_leader(NodeId target) {
+  if (failed_) {
+    return Result<void>::failure(Error::Storage);
+  }
+  if (!initialized_) {
+    return Result<void>::failure(Error::NotInitialized);
+  }
+  if (role() != Role::Leader) {
+    return Result<void>::failure(Error::NotLeader);
+  }
+  const TransferStart started = engine_.begin_transfer(target);
+  if (!started.accepted) {
+    return Result<void>::failure(Error::Rejected);
+  }
+  try {
+    apply(started.step);
+  } catch (const std::runtime_error&) {
+    return Result<void>::failure(Error::Storage);
+  }
+  if (failed_) {
+    return Result<void>::failure(Error::Storage);
+  }
+  return Result<void>::success();
+}
+
+Result<void> RaftNode::poll_leader_transfer() const {
+  if (failed_) {
+    return Result<void>::failure(Error::Storage);
+  }
+  if (!initialized_) {
+    return Result<void>::failure(Error::NotInitialized);
+  }
+  return engine_.poll_transfer();
 }
 
 Result<void> RaftNode::cancel_read(std::uint64_t id) {
@@ -552,6 +611,8 @@ void RaftNode::dispatch(const Envelope& message) {
           send(message.from, step.response);
         } else if constexpr (std::is_same_v<T, InstallSnapshotResponse>) {
           apply(engine_.on_install_response(message.from, payload));
+        } else if constexpr (std::is_same_v<T, TimeoutNow>) {
+          apply(engine_.on_timeout_now(payload));
         }
       },
       message.payload);

@@ -27,6 +27,10 @@ enum class Error {
   // The leader's existing lease does not cover a local read. The call does
   // not return applied state and does not fall back to a quorum read.
   LeaseExpired,
+  // A leader transfer did not make the target leader. The caller did not
+  // lose the request: poll_leader_transfer keeps returning this until the
+  // next transfer_leader. A leader that is still in charge accepts writes again.
+  TransferFailed,
 };
 
 inline const char* to_string(Error error) {
@@ -49,6 +53,8 @@ inline const char* to_string(Error error) {
       return "pending";
     case Error::LeaseExpired:
       return "lease expired";
+    case Error::TransferFailed:
+      return "transfer failed";
   }
   return "unknown";
 }
