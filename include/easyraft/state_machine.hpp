@@ -10,7 +10,8 @@
 
 namespace easyraft {
 
-// Applies committed log entries in index order. Blank entries are delivered so
+// Applies committed log entries in index order. One instance is one group's
+// applied state; do not share it across groups. Blank entries are delivered so
 // the implementation can advance its applied index; application data is the
 // payload clients care about.
 //
