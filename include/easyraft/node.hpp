@@ -21,13 +21,20 @@ namespace easyraft {
 // Runtime around Engine: persists commands, applies committed entries, and
 // exchanges RPCs on a MessageBus. Not thread-safe. Drive it with tick() and
 // the on_* RPC entry points (the in-process network calls those).
+//
+// Each node belongs to one Raft group. The engine is unchanged. The node
+// stamps its group on every outbound envelope and ignores an inbound envelope
+// for any other group before the payload is applied. The default group is 0,
+// which is the only group a single-group caller runs.
 class RaftNode {
  public:
+  // `group` selects this node's Raft group. Existing callers omit it.
   RaftNode(NodeId id,
            Config config,
            std::shared_ptr<RaftLogStorage> storage,
            std::shared_ptr<RaftStateMachine> state_machine,
-           MessageBus* bus);
+           MessageBus* bus,
+           GroupId group = 0);
 
   Result<void> initialize(Membership membership);
   Result<LogIndex> write(std::string data);
@@ -103,6 +110,7 @@ class RaftNode {
   // is destroyed and rebuilt from storage.
   bool failed() const { return failed_; }
   NodeId id() const { return id_; }
+  GroupId group() const { return group_; }
   const Membership& membership() const { return engine_.membership(); }
   Role role() const { return engine_.role(); }
   Term term() const { return engine_.term(); }
@@ -128,6 +136,7 @@ class RaftNode {
   void dispatch(const Envelope& message);
 
   NodeId id_;
+  GroupId group_;
   std::shared_ptr<RaftLogStorage> storage_;
   std::shared_ptr<RaftStateMachine> state_machine_;
   MessageBus* bus_;

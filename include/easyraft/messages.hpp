@@ -141,6 +141,12 @@ struct Envelope {
   NodeId from{0};
   NodeId to{0};
   Payload payload{PreVoteRequest{}};
+  // Group this RPC belongs to. RaftNode applies the payload only when the id
+  // equals its own group, and stamps that id on every message it sends.
+  // AppendEntries, RequestVote, PreVote, InstallSnapshot, and TimeoutNow all
+  // travel in this envelope, so one field routes the existing protocol.
+  // Zero is the single-group default.
+  GroupId group{0};
 };
 
 }  // namespace easyraft

@@ -15,6 +15,10 @@
 namespace easyraft {
 
 using NodeId = std::uint64_t;
+// One independent Raft group. Groups do not share a log, vote, membership,
+// snapshot, or commit index. Zero is a valid id and the group a single-group
+// RaftNode uses unless the caller passes another.
+using GroupId = std::uint64_t;
 using Term = std::uint64_t;
 using LogIndex = std::uint64_t;
 

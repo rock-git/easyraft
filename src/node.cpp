@@ -34,8 +34,10 @@ RaftNode::RaftNode(NodeId id,
                    Config config,
                    std::shared_ptr<RaftLogStorage> storage,
                    std::shared_ptr<RaftStateMachine> state_machine,
-                   MessageBus* bus)
+                   MessageBus* bus,
+                   GroupId group)
     : id_(id),
+      group_(group),
       storage_(std::move(storage)),
       state_machine_(std::move(state_machine)),
       bus_(bus),
@@ -443,6 +445,11 @@ void RaftNode::on_message(const Envelope& message) {
   if (failed_ || !initialized_) {
     return;
   }
+  // A payload for another group is not a stale term or a conflicting log.
+  // Drop it before the engine can vote, append, or install a snapshot.
+  if (message.group != group_) {
+    return;
+  }
   dispatch(message);
 }
 
@@ -577,6 +584,7 @@ void RaftNode::send(NodeId to, Payload payload) {
   envelope.from = id_;
   envelope.to = to;
   envelope.payload = std::move(payload);
+  envelope.group = group_;
   bus_->send(envelope);
 }
 

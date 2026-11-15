@@ -7,6 +7,7 @@
 
 #include <memory>
 #include <stdexcept>
+#include <variant>
 #include <vector>
 
 namespace easyraft {
@@ -61,6 +62,13 @@ class FailAfterAppends final : public RaftLogStorage {
   MemoryLogStorage inner_;
   int succeed_;
   int appends_{0};
+};
+
+class RecordingBus final : public MessageBus {
+ public:
+  void send(const Envelope& message) override { sent.push_back(message); }
+
+  std::vector<Envelope> sent;
 };
 
 class CursorStateMachine final : public RaftStateMachine {
@@ -159,6 +167,110 @@ TEST(Node, RecoverySkipsEntriesTheStateMachineAlreadyApplied) {
   ASSERT_EQ(machine->seen.size(), 1u);
   EXPECT_EQ(machine->seen.front(), 3u);
   EXPECT_EQ(machine->last_applied(), 3u);
+}
+
+TEST(Node, DefaultsToGroupZero) {
+  auto storage = std::make_shared<MemoryLogStorage>();
+  auto machine = std::make_shared<MemoryStateMachine>();
+  RaftNode node(1, pinned(4), storage, machine, nullptr);
+  EXPECT_EQ(node.group(), 0u);
+}
+
+TEST(Node, IgnoresAnotherGroupsRpcAndStampsItsOwn) {
+  auto storage = std::make_shared<MemoryLogStorage>();
+  auto machine = std::make_shared<MemoryStateMachine>();
+  RecordingBus bus;
+  constexpr GroupId group = 7;
+  RaftNode node(1, pinned(4), storage, machine, &bus, group);
+  ASSERT_TRUE(node.initialize(Membership{{1, 2}}).ok());
+  EXPECT_EQ(node.group(), group);
+
+  RequestVote vote;
+  vote.body.vote.leader = LeaderId{3, 2};
+  Envelope granted;
+  granted.from = 2;
+  granted.to = 1;
+  granted.group = group;
+  granted.payload = vote;
+  node.on_message(granted);
+  EXPECT_EQ(node.term(), 3u);
+  EXPECT_EQ(node.vote().leader.node, 2u);
+  EXPECT_EQ(node.role(), Role::Follower);
+  ASSERT_EQ(bus.sent.size(), 1u);
+  EXPECT_EQ(bus.sent[0].group, group);
+  EXPECT_EQ(bus.sent[0].from, 1u);
+  EXPECT_EQ(bus.sent[0].to, 2u);
+  EXPECT_TRUE(std::holds_alternative<RequestVoteResponse>(bus.sent[0].payload));
+
+  const Vote stored = node.vote();
+  const std::size_t log_size = node.log().size();
+  const std::size_t sent_before = bus.sent.size();
+
+  auto deliver = [&](GroupId foreign, Payload payload) {
+    Envelope message;
+    message.from = 2;
+    message.to = 1;
+    message.group = foreign;
+    message.payload = std::move(payload);
+    node.on_message(message);
+  };
+
+  RequestVote higher;
+  higher.body.vote.leader = LeaderId{9, 2};
+  deliver(0, higher);
+  deliver(8, higher);
+
+  PreVoteRequest prevote;
+  prevote.body.vote.leader = LeaderId{10, 2};
+  prevote.probe = 4;
+  deliver(8, prevote);
+
+  AppendEntriesRequest append;
+  append.vote.leader = LeaderId{11, 2};
+  append.vote.committed = true;
+  append.leader_commit = 1;
+  LogEntry foreign_entry;
+  foreign_entry.id = LogId{11, 2, 1};
+  foreign_entry.kind = EntryKind::Application;
+  foreign_entry.data = "other-group";
+  append.entries.push_back(foreign_entry);
+  deliver(8, append);
+
+  InstallSnapshotRequest snapshot;
+  snapshot.vote.leader = LeaderId{12, 2};
+  snapshot.vote.committed = true;
+  snapshot.meta.last_included = LogId{12, 2, 4};
+  snapshot.meta.membership = Membership{{1, 2}};
+  snapshot.meta.snapshot_id = "4-12-2";
+  snapshot.data = "other-snapshot";
+  snapshot.done = true;
+  deliver(8, snapshot);
+
+  TimeoutNow timeout;
+  timeout.leader.leader = LeaderId{13, 2};
+  timeout.leader.committed = true;
+  deliver(8, timeout);
+
+  EXPECT_EQ(node.vote(), stored);
+  EXPECT_EQ(node.term(), stored.leader.term);
+  EXPECT_EQ(node.role(), Role::Follower);
+  EXPECT_EQ(node.log().size(), log_size);
+  EXPECT_FALSE(node.snapshot_meta().has_value());
+  EXPECT_FALSE(node.failed());
+  EXPECT_EQ(storage->persisted_vote(), stored);
+  EXPECT_EQ(bus.sent.size(), sent_before);
+  for (const LogEntry& item : node.log()) {
+    EXPECT_NE(item.data, "other-group");
+  }
+
+  for (int tick = 0; tick < 4; ++tick) {
+    node.tick();
+  }
+  ASSERT_GT(bus.sent.size(), sent_before);
+  for (const Envelope& message : bus.sent) {
+    EXPECT_EQ(message.group, group);
+    EXPECT_EQ(message.from, 1u);
+  }
 }
 
 }  // namespace
